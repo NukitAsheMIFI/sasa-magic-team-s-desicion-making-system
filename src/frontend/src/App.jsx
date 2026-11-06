@@ -7,9 +7,33 @@ export default function App() {
   const [onlyFails, setOnlyFails] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [currentUser, setCurrentUser] = useState('Аналитик 1 (Иван)');
-
-  // 1. ПАМЯТЬ: идёт ли сейчас расчёт на сервере
   const [isRunning, setIsRunning] = useState(false);
+
+  // 1. МЕТРИКИ ДЛЯ КАЖДОГО АНАЛИТИКА
+  const userMetrics = {
+    'Аналитик 1 (Иван)': {
+      approvalBefore: '64.0%',
+      approvalAfter: '58.2%',
+      approvalDiff: '-5.8%',
+      isNegative: true,
+      flippedCount: 31,
+      flippedPercent: '6.2%',
+      avgScoreBefore: '0.045',
+      avgScoreAfter: '0.039',
+      scoreDiff: '-0.006 (риск ниже)',
+    },
+    'Аналитик 2 (Мария)': {
+      approvalBefore: '70.5%',
+      approvalAfter: '73.0%',
+      approvalDiff: '+2.5%',
+      isNegative: false,
+      flippedCount: 14,
+      flippedPercent: '2.8%',
+      avgScoreBefore: '0.052',
+      avgScoreAfter: '0.050',
+      scoreDiff: '-0.002 (риск ниже)',
+    },
+  };
 
   const [userChecks, setUserChecks] = useState({
     'Аналитик 1 (Иван)': [
@@ -58,17 +82,13 @@ export default function App() {
   });
 
   const currentChecks = userChecks[currentUser] || [];
+  const currentMetrics = userMetrics[currentUser];
   const displayedChecks = currentChecks.filter((item) => (onlyFails ? item.status === 'FAIL' : true));
 
-  // 2. ФУНКЦИЯ ЗАПУСКА: имитирует запрос к Python-бэкенду
   const handleStartAnalysis = () => {
     setIsRunning(true);
-
-    // Имитируем ожидание ответа бэкенда (2000 мс = 2 секунды)
     setTimeout(() => {
-      // Когда ответ пришёл:
       setIsRunning(false);
-      // Автоматически переносим пользователя на экран отчёта
       setTab('report');
     }, 2000);
   };
@@ -96,17 +116,17 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-screen bg-white text-gray-900 font-sans flex flex-col">
+    <div className="min-h-screen bg-slate-50/50 text-gray-900 font-sans flex flex-col">
       
       {/* Шапка */}
-      <header className="border-b border-gray-200 bg-gray-50/80 px-6 py-2.5 flex items-center justify-between sticky top-0 z-40 backdrop-blur">
+      <header className="border-b border-gray-200 bg-white/90 px-6 py-2.5 flex items-center justify-between sticky top-0 z-40 backdrop-blur">
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse"></span>
             <span className="font-bold text-sm tracking-tight text-gray-800">СПР • Анализ изменений</span>
           </div>
 
-          <nav className="flex gap-1 bg-gray-200/70 p-1 rounded-lg">
+          <nav className="flex gap-1 bg-gray-100 p-1 rounded-lg">
             <button
               onClick={() => setTab('report')}
               className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
@@ -141,122 +161,181 @@ export default function App() {
 
           <button
             onClick={() => alert(`Экспорт отчёта для: ${currentUser}`)}
-            className="flex items-center gap-1.5 bg-gray-900 hover:bg-gray-800 text-white px-3 py-1 rounded-lg text-xs font-medium transition shadow-xs"
+            className="bg-gray-900 hover:bg-gray-800 text-white px-3 py-1 rounded-lg text-xs font-medium transition shadow-xs"
           >
-            <span>Скачать HTML</span>
+            Скачать HTML
           </button>
         </div>
       </header>
 
-      {/* Основной контент */}
-      <main className="flex-1 p-6 max-w-xl w-full mx-auto">
+      {/* Основной контейнер */}
+      <main className="flex-1 p-6 max-w-3xl w-full mx-auto space-y-6">
         
-        {/* ВКЛАДКА 1: ОТЧЁТ */}
         {tab === 'report' && (
-          <div className="space-y-4">
-            <div className="flex justify-between items-center">
-              <div>
-                <h2 className="text-lg font-bold">Список проверок</h2>
-                <p className="text-xs text-gray-500">Пространство: {currentUser}</p>
-              </div>
+          <>
+            {/* ── 2. БЛОК СВОДНЫХ МЕТРИК (KPI) ── */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setOnlyFails(!onlyFails)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
-                    onlyFails
-                      ? 'bg-red-50 text-red-700 border-red-300'
-                      : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
-                  }`}
-                >
-                  {onlyFails ? '● Только FAIL' : '○ Только FAIL'}
-                </button>
-
-                <button
-                  onClick={() => setIsModalOpen(true)}
-                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm"
-                >
-                  + Добавить
-                </button>
-              </div>
-            </div>
-            
-            <div className="space-y-2">
-              {displayedChecks.map((item) => (
-                <div
-                  key={item.id}
-                  onClick={() => { setSelected(item); setSelectedApp(null); }}
-                  className={`p-3 border rounded-lg cursor-pointer transition flex justify-between items-center ${
-                    selected?.id === item.id ? 'border-blue-500 bg-blue-50' : 'border-gray-200 hover:bg-gray-50'
-                  }`}
-                >
-                  <span className="font-medium text-sm">{item.name}</span>
-                  <span className={`font-bold text-sm ${item.status === 'PASS' ? 'text-green-600' : 'text-red-600'}`}>
-                    {item.status} ({item.count})
+              {/* Карточка 1: Одобряемость */}
+              <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-xs">
+                <div className="text-xs font-medium text-gray-500 mb-1">Уровень одобрения</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-gray-900">
+                    {currentMetrics.approvalAfter}
+                  </div>
+                  <span className={`text-xs font-bold px-1.5 py-0.5 rounded ${
+                    currentMetrics.isNegative 
+                      ? 'bg-amber-100 text-amber-800' 
+                      : 'bg-emerald-100 text-emerald-800'
+                  }`}>
+                    {currentMetrics.approvalDiff}
                   </span>
                 </div>
-              ))}
+                <div className="text-[11px] text-gray-400 mt-1">
+                  Было в проде: <span className="font-medium text-gray-600">{currentMetrics.approvalBefore}</span>
+                </div>
+              </div>
+
+              {/* Карточка 2: Спорные заявки (Flipped) */}
+              <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-xs">
+                <div className="text-xs font-medium text-gray-500 mb-1">Расхождения в решении</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-gray-900">
+                    {currentMetrics.flippedCount}
+                  </div>
+                  <span className="text-xs font-semibold text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
+                    {currentMetrics.flippedPercent}
+                  </span>
+                </div>
+                <div className="text-[11px] text-gray-400 mt-1">
+                  Заявок изменили исход (Flip)
+                </div>
+              </div>
+
+              {/* Карточка 3: Средний скор риска */}
+              <div className="bg-white p-4 rounded-xl border border-gray-200 shadow-xs">
+                <div className="text-xs font-medium text-gray-500 mb-1">Средний PD (риск)</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-gray-900">
+                    {currentMetrics.avgScoreAfter}
+                  </div>
+                  <span className="text-xs font-semibold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">
+                    {currentMetrics.scoreDiff}
+                  </span>
+                </div>
+                <div className="text-[11px] text-gray-400 mt-1">
+                  Было: <span className="font-medium text-gray-600">{currentMetrics.avgScoreBefore}</span>
+                </div>
+              </div>
+
             </div>
 
-            {selected && (
-              <div className="p-4 bg-gray-50 border border-gray-200 rounded-xl space-y-3">
-                <h3 className="font-semibold text-sm text-gray-700">
-                  Заявки по проверке «{selected.name}»:
-                </h3>
+            {/* ── СПИСОК ПРОВЕРОК ── */}
+            <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-xs space-y-4">
+              <div className="flex justify-between items-center">
+                <div>
+                  <h2 className="text-base font-bold">Список проверок стратегии</h2>
+                  <p className="text-xs text-gray-500">Профиль: {currentUser}</p>
+                </div>
+                
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => setOnlyFails(!onlyFails)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
+                      onlyFails
+                        ? 'bg-red-50 text-red-700 border-red-300'
+                        : 'bg-white text-gray-600 border-gray-300 hover:bg-gray-50'
+                    }`}
+                  >
+                    {onlyFails ? '● Только FAIL' : '○ Только FAIL'}
+                  </button>
 
-                {selected.apps.length === 0 ? (
-                  <p className="text-xs text-gray-400">Нарушений нет, список заявок пуст.</p>
-                ) : (
-                  <div className="flex gap-2">
-                    {selected.apps.map((app) => (
-                      <button
-                        key={app.id}
-                        onClick={() => setSelectedApp(app)}
-                        className={`px-3 py-1.5 rounded text-xs font-mono border transition ${
-                          selectedApp?.id === app.id
-                            ? 'bg-blue-600 text-white border-blue-600'
-                            : 'bg-white text-gray-800 border-gray-300 hover:bg-gray-100'
-                        }`}
-                      >
-                        {app.id}
-                      </button>
-                    ))}
-                  </div>
-                )}
-
-                {selectedApp && (
-                  <div className="mt-3 p-3 bg-white border border-blue-200 rounded-lg text-xs space-y-1.5 shadow-sm">
-                    <div className="font-bold text-gray-700">Результат для {selectedApp.id}:</div>
-                    <div className="flex justify-between text-red-600">
-                      <span>BEFORE (Прод):</span>
-                      <span className="font-mono">{selectedApp.before}</span>
-                    </div>
-                    <div className="flex justify-between text-green-600">
-                      <span>AFTER (Новая версия):</span>
-                      <span className="font-mono">{selectedApp.after}</span>
-                    </div>
-                  </div>
-                )}
+                  <button
+                    onClick={() => setIsModalOpen(true)}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm"
+                  >
+                    + Добавить
+                  </button>
+                </div>
               </div>
-            )}
-          </div>
+              
+              <div className="space-y-2">
+                {displayedChecks.map((item) => (
+                  <div
+                    key={item.id}
+                    onClick={() => { setSelected(item); setSelectedApp(null); }}
+                    className={`p-3 border rounded-lg cursor-pointer transition flex justify-between items-center ${
+                      selected?.id === item.id ? 'border-blue-500 bg-blue-50/60' : 'border-gray-200 hover:bg-gray-50'
+                    }`}
+                  >
+                    <span className="font-medium text-sm">{item.name}</span>
+                    <span className={`font-bold text-sm ${item.status === 'PASS' ? 'text-green-600' : 'text-red-600'}`}>
+                      {item.status} ({item.count})
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Drill-down блок */}
+              {selected && (
+                <div className="p-4 bg-gray-50 border border-gray-200 rounded-xl space-y-3">
+                  <h3 className="font-semibold text-xs text-gray-700 uppercase tracking-wider">
+                    Затронутые заявки: {selected.name}
+                  </h3>
+
+                  {selected.apps.length === 0 ? (
+                    <p className="text-xs text-gray-400">Нарушений нет, список заявок пуст.</p>
+                  ) : (
+                    <div className="flex gap-2">
+                      {selected.apps.map((app) => (
+                        <button
+                          key={app.id}
+                          onClick={() => setSelectedApp(app)}
+                          className={`px-3 py-1.5 rounded text-xs font-mono border transition ${
+                            selectedApp?.id === app.id
+                              ? 'bg-blue-600 text-white border-blue-600'
+                              : 'bg-white text-gray-800 border-gray-300 hover:bg-gray-100'
+                          }`}
+                        >
+                          {app.id}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {selectedApp && (
+                    <div className="mt-3 p-3 bg-white border border-blue-200 rounded-lg text-xs space-y-1.5 shadow-xs">
+                      <div className="font-bold text-gray-700">Результат для {selectedApp.id}:</div>
+                      <div className="flex justify-between text-red-600">
+                        <span>BEFORE (Прод):</span>
+                        <span className="font-mono">{selectedApp.before}</span>
+                      </div>
+                      <div className="flex justify-between text-green-600">
+                        <span>AFTER (Новая версия):</span>
+                        <span className="font-mono">{selectedApp.after}</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </>
         )}
 
-        {/* ВКЛАДКА 2: ЗАПУСК */}
+        {/* ВКЛАДКА ЗАПУСКА */}
         {tab === 'run' && (
-          <div className="p-5 border border-gray-200 rounded-xl space-y-4 shadow-xs">
-            <h2 className="text-lg font-bold">Настройка запуска</h2>
+          <div className="bg-white p-6 border border-gray-200 rounded-xl space-y-4 shadow-xs">
+            <h2 className="text-base font-bold">Настройка параметров запуска</h2>
             <p className="text-xs text-gray-500">Запуск от имени: <span className="font-semibold text-gray-800">{currentUser}</span></p>
             
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Выбор датасета заявок</label>
-              <select className="w-full bg-white border border-gray-300 rounded-lg p-2 text-sm text-gray-700 focus:outline-none focus:ring-1 focus:ring-blue-500">
+              <label className="block text-xs font-medium text-gray-700 mb-1">Выбор тестового датасета</label>
+              <select className="w-full bg-white border border-gray-300 rounded-lg p-2 text-sm text-gray-700">
                 <option>RUN-20260827-0001 (500 заявок • Ипотека)</option>
                 <option>RUN-20260901-0042 (1200 заявок • Потребы)</option>
               </select>
             </div>
 
-            {/* 3. КНОПКА С СОСТОЯНИЕМ ЗАГРУЗКИ */}
             <button 
               disabled={isRunning}
               onClick={handleStartAnalysis}
@@ -275,12 +354,6 @@ export default function App() {
                 'Старт анализа'
               )}
             </button>
-
-            {isRunning && (
-              <p className="text-xs text-center text-gray-500 animate-pulse">
-                Бэкенд сравнивает прод-ветку с тестовой версией...
-              </p>
-            )}
           </div>
         )}
 
@@ -301,7 +374,7 @@ export default function App() {
             </div>
             
             <p className="text-xs text-gray-500">
-              Это правило будет добавлено только в рабочее пространство текущего аналитика.
+              Это правило будет добавлено в конфигурацию стратегии текущего аналитика.
             </p>
 
             <div className="flex justify-end gap-2 pt-2">
