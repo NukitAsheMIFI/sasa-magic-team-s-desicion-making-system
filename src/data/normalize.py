@@ -5,11 +5,13 @@ import pandas as pd
 # Технические поля исключаем сразу чтобы не ловить шум
 EXCLUDE_PATHS = {
     "appData.request_id",
-    "appData.createDateTime"
+    "appData.createDateTime",
+    "company.decisionResult.calculatedAt"
 }
 
 # Правила поиска ключа элемента для каждого типа массива
 ARRAY_KEY_RULES = {
+    "company.scoreCardResult": lambda item: str(item.get("name")),
     "decisionResult.available_offers": lambda item: f"{item.get('product_id')}+{item.get('type')}",
     "decisionResult.product_trials": lambda item: str(item.get("product_id")),
     "decisionResult.product_trials.rules": lambda item: str(item.get("name")),
