@@ -8,3 +8,5 @@ docker compose up --build -d
 
 echo "=== Контейнер запущен! ==="
 echo "Приложение доступно по адресу: http://localhost:8000"
+
+# script ready
