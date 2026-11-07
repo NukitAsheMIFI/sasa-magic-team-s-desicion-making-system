@@ -1,10 +1,11 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
+import CodeMirror from '@uiw/react-codemirror';
+import { python } from '@codemirror/lang-python';
 
-// Локальные демо-данные на случай, если FastAPI выключен
+// Демо-данные из репозитория (используются при недоступности API)
 import fallbackPivotFacts from './data/08_pivot_facts_demo.json';
 import fallbackComparisonCsv from './data/06_comparison_app1001.csv?raw';
 
-// Парсер CSV с разделителем ";"
 function parseSemicolonCsv(text) {
   if (!text) return [];
   const lines = text.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
@@ -21,12 +22,68 @@ function parseSemicolonCsv(text) {
   });
 }
 
+// Заготовки исходного кода шагов пайплайна
+const PIPELINE_STEP_CODES = {
+  load: `# Шаг 1: Загрузка и чтение исходных ответов СПР
+import os, json
+
+def load_credit_files(folder_path: str):
+    """Рекурсивное чтение файлов заявок BEFORE (MASTER) и AFTER (BETA)"""
+    files = [f for f in os.listdir(folder_path) if f.endswith('.json')]
+    print(f"Обнаружено файлов в выборке: {len(files)}")
+    return files
+`,
+  normalize: `# Шаг 2: Динамический обход JSON (Generic Flattener)
+def flatten_json(data, prefix='', path=''):
+    """Рекурсивный разбор структуры любой глубины без хардкода имен полей"""
+    items = []
+    if isinstance(data, dict):
+        for k, v in data.items():
+            new_path = f"{path}.{k}" if path else k
+            items.extend(flatten_json(v, prefix, new_path))
+    elif isinstance(data, list):
+        for idx, item in enumerate(data):
+            items.extend(flatten_json(item, prefix, f"{path}[{idx}]"))
+    else:
+        items.append({"key": path, "value": str(data)})
+    return items
+`,
+  union: `# Шаг 3: Вертикальный UNION и расчет расхождений (DIFF_FLAG)
+import duckdb
+
+def build_diff_storage(conn):
+    """Склейка срезов и классификация различий"""
+    conn.execute("""
+        CREATE TABLE mart_rows AS 
+        SELECT 
+            b.app_id, b.key,
+            b.value as value_before,
+            a.value as value_after,
+            CASE WHEN b.value != a.value THEN 1 ELSE 0 END as diff_flag
+        FROM raw_before b
+        FULL OUTER JOIN raw_after a ON b.app_id = a.app_id AND b.key = a.key
+    """)
+`,
+  checks: `# Шаг 4: Исполнение автопроверок риск-стратегии
+def check_approval_rate_drop(diff_df, max_drop=0.02):
+    """Контроль просадки уровня одобрения портфеля"""
+    before_rate = (diff_df['decision_before'] == 'APPROVE').mean()
+    after_rate = (diff_df['decision_after'] == 'APPROVE').mean()
+    delta = after_rate - before_rate
+    return {
+        "status": "PASS" if delta >= -max_drop else "FAIL",
+        "delta": round(delta * 100, 2)
+    }
+`
+};
+
 const DEFAULT_WORKSPACES = {
   'Аналитик 1 (Иван)': {
     onlyDiffRows: false,
     searchFilter: '',
     sortByImpact: true,
     customRules: [],
+    customChecks: [],
     pivotReviews: {},
     appReviews: {}
   },
@@ -35,67 +92,78 @@ const DEFAULT_WORKSPACES = {
     searchFilter: '',
     sortByImpact: true,
     customRules: [],
+    customChecks: [],
     pivotReviews: {},
     appReviews: {}
   }
 };
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState('matrix');
+  const [activeTab, setActiveTab] = useState('matrix'); // 'run' | 'matrix' | 'registry'
   const [currentUser, setCurrentUser] = useState('Аналитик 1 (Иван)');
 
-  // ── ПРЯМОЕ ПОДКЛЮЧЕНИЕ К БЭКЕНДУ БЕЗ ПРОКСИ ──
+  // Настройки подключения к FastAPI
   const [backendUrl, setBackendUrl] = useState(() => {
     return localStorage.getItem('spr_backend_url') || 'http://localhost:8000';
   });
-  const [reportId, setReportId] = useState('1');
+  const [reportId, setReportId] = useState('2');
   const [pivotFacts, setPivotFacts] = useState(fallbackPivotFacts);
+  const [apiAppsList, setApiAppsList] = useState([]);
   const [isLoadingApi, setIsLoadingApi] = useState(false);
-  const [apiStatus, setApiStatus] = useState('init'); // 'connected' | 'fallback' | 'init'
-  const [apiErrorText, setApiErrorText] = useState('');
+  const [apiStatus, setApiStatus] = useState('init');
 
-  // Прямой запрос к FastAPI: http://localhost:8000/api/reports/1/pivot-facts
-  const fetchPivotFactsDirect = useCallback(async (baseUrl, targetReportId) => {
-    setIsLoadingApi(true);
-    setApiErrorText('');
-    const cleanBaseUrl = baseUrl.trim().replace(/\/+$/, '');
+  // Состояния пайплайна и запуска
+  const [activeRunId, setActiveRunId] = useState(null);
+  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
+  const [pipelineSteps, setPipelineSteps] = useState([
+    { id: 'load', name: '1. Загрузка JSON-файлов датасета', status: 'done', time: '0.4s' },
+    { id: 'normalize', name: '2. Динамическая нормализация (Generic Flattener)', status: 'done', time: '1.8s' },
+    { id: 'union', name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'done', time: '0.9s' },
+    { id: 'checks', name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'done', time: '0.3s' }
+  ]);
+  const [runConfig, setRunConfig] = useState({
+    dataset: 'RUN-20260827-0001 (2002 заявки, 2 среза)',
+    normalizer: 'normalizer_dynamic.py',
+    checks: ['approval_rate', 'stop_factors', 'scorecard_cutoff']
+  });
+  const pollingRef = useRef(null);
 
-    try {
-      localStorage.setItem('spr_backend_url', cleanBaseUrl);
-      const fullUrl = `${cleanBaseUrl}/api/reports/${targetReportId}/pivot-facts`;
+  // Редактор и просмотр кода CodeMirror
+  const [codeEditorModal, setCodeEditorModal] = useState({
+    isOpen: false,
+    title: '',
+    code: '',
+    readOnly: true,
+    onSave: null
+  });
 
-      const response = await fetch(fullUrl);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+  // Master-Detail и фильтрация
+  const [expandedSegmentClass, setExpandedSegmentClass] = useState(null);
+  const [selectedQualityGateId, setSelectedQualityGateId] = useState(null);
+  const [collapsedClasses, setCollapsedClasses] = useState({});
+  const [selectedPivotFilter, setSelectedPivotFilter] = useState(null);
 
-      const json = await response.json();
-      if (!Array.isArray(json)) {
-        throw new Error('Ответ не является массивом JSON');
-      }
+  // Боковое досье
+  const [activeDossierApp, setActiveDossierApp] = useState(null);
+  const [dossierRows, setDossierRows] = useState([]);
+  const [isDossierLoading, setIsDossierLoading] = useState(false);
+  const [manualAppInput, setManualAppInput] = useState('');
 
-      console.log('Данные пришли напрямую с бэкенда:', json.length, 'строк');
-      setPivotFacts(json);
-      setApiStatus('connected');
-    } catch (error) {
-      console.warn('Ошибка прямого запроса к FastAPI, включён демо-файл:', error.message);
-      setPivotFacts(fallbackPivotFacts);
-      setApiStatus('fallback');
-      setApiErrorText(error.message);
-    } finally {
-      setIsLoadingApi(false);
-    }
-  }, []);
+  // Модальные окна
+  const [isCheckModalOpen, setIsCheckModalOpen] = useState(false);
+  const [newCheckName, setNewCheckName] = useState('');
+  const [newCheckClass, setNewCheckClass] = useState('decisionResult');
+  const [newCheckArg, setNewCheckArg] = useState('decision = APPROVE');
+  const [newCheckThreshold, setNewCheckThreshold] = useState('Δ AR ≥ -2.0%');
+  const [newCheckCode, setNewCheckCode] = useState(`def check_custom_rule(mart_df):\n    """Пользовательское правило риск-политики"""\n    violations = mart_df.filter(diff_flag=1)\n    return {"status": "PASS" if len(violations) == 0 else "FAIL"}\n`);
 
-  // Первичная загрузка при открытии страницы
-  useEffect(() => {
-    fetchPivotFactsDirect(backendUrl, reportId);
-  }, []); // Загружаем при старте, дальше обновляем кнопкой «Подключить / ↻»
+  const [newUserModalOpen, setNewUserModalOpen] = useState(false);
+  const [newUserName, setNewUserName] = useState('');
 
-  // ── ПРОФИЛИ ПОЛЬЗОВАТЕЛЕЙ ──
+  // Многопользовательское хранилище
   const [workspaces, setWorkspaces] = useState(() => {
     try {
-      const saved = localStorage.getItem('spr_diff_workspaces_v4');
+      const saved = localStorage.getItem('spr_diff_workspaces_v9');
       return saved ? JSON.parse(saved) : DEFAULT_WORKSPACES;
     } catch {
       return DEFAULT_WORKSPACES;
@@ -104,22 +172,9 @@ export default function App() {
 
   useEffect(() => {
     try {
-      localStorage.setItem('spr_diff_workspaces_v4', JSON.stringify(workspaces));
-    } catch {
-      // игнорируем переполнение localStorage
-    }
+      localStorage.setItem('spr_diff_workspaces_v9', JSON.stringify(workspaces));
+    } catch {}
   }, [workspaces]);
-
-  const [collapsedClasses, setCollapsedClasses] = useState({});
-  const [selectedPivotFilter, setSelectedPivotFilter] = useState(null);
-  const [selectedTransitionFilter, setSelectedTransitionFilter] = useState('ALL');
-  const [activeDossierApp, setActiveDossierApp] = useState(null);
-
-  const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
-  const [newRuleClass, setNewRuleClass] = useState('');
-  const [newRuleKey, setNewRuleKey] = useState('');
-  const [newUserModalOpen, setNewUserModalOpen] = useState(false);
-  const [newUserName, setNewUserName] = useState('');
 
   const currentWorkspace = workspaces[currentUser] || DEFAULT_WORKSPACES['Аналитик 1 (Иван)'];
 
@@ -133,14 +188,126 @@ export default function App() {
     }));
   };
 
-  // ── 1. ПАРСИНГ ДЕТАЛЬНОГО CSV ЗАЯВОК ──
+  // Запрос агрегированной витрины и реестра с бэкенда
+  const fetchBackendData = useCallback(async (baseUrl, targetReportId) => {
+    setIsLoadingApi(true);
+    const cleanBaseUrl = baseUrl.trim().replace(/\/+$/, '');
+
+    try {
+      localStorage.setItem('spr_backend_url', cleanBaseUrl);
+      const resFacts = await fetch(`${cleanBaseUrl}/api/reports/${targetReportId}/pivot-facts`);
+      if (resFacts.ok) {
+        const jsonFacts = await resFacts.json();
+        if (Array.isArray(jsonFacts)) setPivotFacts(jsonFacts);
+      }
+
+      const resApps = await fetch(`${cleanBaseUrl}/api/reports/${targetReportId}/applications`);
+      if (resApps.ok) {
+        const jsonApps = await resApps.json();
+        if (Array.isArray(jsonApps)) setApiAppsList(jsonApps);
+      } else {
+        setApiAppsList([]);
+      }
+
+      setApiStatus('connected');
+    } catch {
+      setPivotFacts(fallbackPivotFacts);
+      setApiAppsList([]);
+      setApiStatus('fallback');
+    } finally {
+      setIsLoadingApi(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchBackendData(backendUrl, reportId);
+  }, [fetchBackendData, backendUrl, reportId]);
+
+  // Запуск пайплайна расчета (POST /api/runs/) с последующим поллингом (/steps)
+  const handleStartPipelineRun = async () => {
+    setIsPipelineRunning(true);
+    const cleanBaseUrl = backendUrl.trim().replace(/\/+$/, '');
+    const userId = currentUser.includes('2') ? 2 : 1;
+
+    setPipelineSteps([
+      { id: 'load', name: '1. Загрузка JSON-файлов датасета', status: 'running', time: '...' },
+      { id: 'normalize', name: '2. Динамическая нормализация (Generic Flattener)', status: 'pending', time: '—' },
+      { id: 'union', name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'pending', time: '—' },
+      { id: 'checks', name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'pending', time: '—' }
+    ]);
+
+    try {
+      const res = await fetch(`${cleanBaseUrl}/api/runs/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: userId, config: runConfig })
+      });
+
+      if (!res.ok) throw new Error(`Ошибка старта запуска: HTTP ${res.status}`);
+      const runData = await res.json();
+      const newRunId = runData.id || runData.run_id || 1;
+      setActiveRunId(newRunId);
+
+      if (pollingRef.current) clearInterval(pollingRef.current);
+      pollingRef.current = setInterval(async () => {
+        try {
+          const stepsRes = await fetch(`${cleanBaseUrl}/api/runs/${newRunId}/steps`);
+          if (stepsRes.ok) {
+            const stepsData = await stepsRes.json();
+            if (Array.isArray(stepsData) && stepsData.length > 0) {
+              setPipelineSteps(stepsData.map((s, idx) => ({
+                id: s.name || `step_${idx}`,
+                name: s.name ? `${idx + 1}. ${s.name}` : `Этап ${idx + 1}`,
+                status: s.status || (s.is_done ? 'done' : 'running'),
+                time: s.finished_at ? 'OK' : '...',
+                logs: s.logs
+              })));
+
+              // Проверяем сбой на любом из шагов
+              const failedStep = stepsData.find((s) => s.status === 'failed');
+              if (failedStep) {
+                clearInterval(pollingRef.current);
+                setIsPipelineRunning(false);
+                alert(`Ошибка на этапе ${failedStep.name}!\nЛог: ${failedStep.logs || 'Неизвестная ошибка'}`);
+                return;
+              }
+
+              // Только если ВСЕ шаги завершились успешно
+              const allDone = stepsData.every((s) => s.status === 'done' || s.is_done);
+              if (allDone) {
+                clearInterval(pollingRef.current);
+                setIsPipelineRunning(false);
+                setReportId(String(newRunId));
+                await fetchBackendData(backendUrl, String(newRunId));
+                setActiveTab('matrix');
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('Ошибка опроса шагов:', err);
+        }
+      }, 1000);
+
+    } catch (err) {
+      setIsPipelineRunning(false);
+      alert(`Не удалось запустить пайплайн: ${err.message}`);
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (pollingRef.current) clearInterval(pollingRef.current);
+    };
+  }, []);
+
+  // Парсинг локального CSV
   const parsedComparisonRows = useMemo(() => parseSemicolonCsv(fallbackComparisonCsv), []);
 
   const appsDatabase = useMemo(() => {
     const map = {};
     parsedComparisonRows.forEach((row) => {
-      const rawId = row.APP_ID || 'UNKNOWN';
-      const appId = rawId.startsWith('APP-') ? rawId : `APP-${rawId}`;
+      const rawId = row.APP_ID || '1001';
+      const appId = String(rawId);
       if (!map[appId]) map[appId] = [];
       map[appId].push(row);
     });
@@ -148,44 +315,87 @@ export default function App() {
   }, [parsedComparisonRows]);
 
   const registeredAppList = useMemo(() => {
+    if (apiAppsList.length > 0) {
+      return apiAppsList.map((app) => {
+        const id = String(app.app_id || app.id || app.APP_ID);
+        const decAfter = app.decision_after || app.afterDecision || app.VALUE_AFTER || '—';
+        const diffCnt = app.diff_count ?? app.diffCount ?? 0;
+
+        return {
+          id,
+          rawRows: appsDatabase[id] || [],
+          beforeDecision: app.beforeDecision || '—',
+          afterDecision: decAfter,
+          diffCount: diffCnt,
+          driver: decAfter === 'UNKNOWN' 
+            ? 'Решение: UNKNOWN (путь уточняется)' 
+            : `Решение в BETA: ${decAfter}`
+        };
+      });
+    }
+
     return Object.keys(appsDatabase).map((appId) => {
       const rows = appsDatabase[appId];
-      const decRow = rows.find((r) => r.KEY === 'decision') || rows[0];
-      const limitRow = rows.find((r) => r.KEY === 'limit');
-      const diffRows = rows.filter((r) => String(r.DIFF_FLAG) === '1');
-
-      const beforeDec = decRow?.VALUE_BEFORE || '—';
-      const afterDec = decRow?.VALUE_AFTER || '—';
+      const decRow = rows.find((r) => (r.KEY || '').toLowerCase().includes('decision')) || rows[0];
+      const diffRows = rows.filter((r) => Number(r.DIFF_FLAG) === 1);
 
       return {
         id: appId,
         rawRows: rows,
-        beforeDecision: beforeDec,
-        afterDecision: afterDec,
-        transition: `${beforeDec} → ${afterDec}`,
-        limitBefore: limitRow?.VALUE_BEFORE ? `${Number(limitRow.VALUE_BEFORE).toLocaleString('ru-RU')} ₽` : '—',
-        limitAfter: limitRow?.VALUE_AFTER ? `${Number(limitRow.VALUE_AFTER).toLocaleString('ru-RU')} ₽` : '—',
-        limitBucketBefore: limitRow?.ADJUSTED_BEFORE || '—',
-        limitBucketAfter: limitRow?.ADJUSTED_AFTER || '—',
+        beforeDecision: decRow?.VALUE_BEFORE || '—',
+        afterDecision: decRow?.VALUE_AFTER || '—',
         diffCount: diffRows.length,
-        driver: diffRows.map((r) => r.COMMENT).filter(Boolean).join('; ') || 'Без изменений'
+        driver: diffRows.map((r) => r.COMMENT).filter(Boolean).join('; ') || 'Без комментариев'
       };
     });
-  }, [appsDatabase]);
+  }, [apiAppsList, appsDatabase]);
 
-  // ── 2. АГРЕГАЦИЯ ДАННЫХ ОТ БЭКЕНДА В МАТРИЦУ ──
+  const handleOpenDossier = useCallback(async (appId) => {
+    if (!appId) return;
+    const cleanId = String(appId).trim();
+    setActiveDossierApp(cleanId);
+
+    const targetQueryId = cleanId.replace(/^APP-/, '');
+    const localRows = appsDatabase[cleanId] || appsDatabase[targetQueryId] || [];
+    setDossierRows(localRows);
+
+    if (apiStatus === 'connected' && backendUrl) {
+      setIsDossierLoading(true);
+      try {
+        const cleanBaseUrl = backendUrl.trim().replace(/\/+$/, '');
+        const res = await fetch(`${cleanBaseUrl}/api/reports/${reportId}/applications/${encodeURIComponent(targetQueryId)}/diff`);
+        if (res.ok) {
+          const json = await res.json();
+          if (Array.isArray(json) && json.length > 0) {
+            setDossierRows(json);
+          }
+        }
+      } catch {
+      } finally {
+        setIsDossierLoading(false);
+      }
+    }
+  }, [apiStatus, backendUrl, reportId, appsDatabase]);
+
+  // Агрегация витрины facts
   const combinedPivotFacts = useMemo(() => {
     return [...pivotFacts, ...(currentWorkspace.customRules || [])];
   }, [pivotFacts, currentWorkspace.customRules]);
 
-  const { decisionSummaryRows, groupedParameterBlocks, summaryMetrics } = useMemo(() => {
+  const {
+    decisionSummaryRows,
+    groupedParameterBlocks,
+    summaryMetrics,
+    transitionMatrix,
+    qualityGates
+  } = useMemo(() => {
     const map = {};
 
     combinedPivotFacts.forEach((row) => {
-      const cls = row.CLASS || 'Other';
-      const arrKey = row.ARRAY_KEY || '';
-      const key = row.KEY || '';
-      const val = row.VALUE_ADJUSTED || '';
+      const cls = row.PREFIX || row.CLASS || 'Общие параметры';
+      const arrKey = row.ARRAY_KEY ? String(row.ARRAY_KEY) : '';
+      const key = row.KEY ? String(row.KEY) : '';
+      const val = row.VALUE_ADJUSTED ?? row.VALUE_AFTER ?? row.VALUE_BEFORE ?? '—';
       const rowId = `${cls}__${arrKey}__${key}__${val}`;
 
       if (!map[rowId]) {
@@ -202,8 +412,8 @@ export default function App() {
       }
 
       const count = Number(row.CNT) || 0;
-      const isDiff = String(row.DIFF_FLAG) === '1';
-      const isBefore = (row.SOURCE || '').includes('BEFORE');
+      const isDiff = Number(row.DIFF_FLAG) === 1;
+      const isBefore = String(row.SOURCE || '').toUpperCase().includes('BEFORE');
 
       if (!isDiff) {
         if (isBefore) map[rowId].stableCount += count;
@@ -221,60 +431,158 @@ export default function App() {
       const totalAfter = r.stableCount + r.arrivedCount;
       const netDelta = totalAfter - totalBefore;
       const totalChanges = r.leftCount + r.arrivedCount;
+      const affectedClientsInBucket = Math.max(r.leftCount, r.arrivedCount);
       return {
         ...r,
         totalBefore,
         totalAfter,
         netDelta,
         absDelta: Math.abs(netDelta),
-        totalChanges
+        totalChanges,
+        affectedClientsInBucket
       };
     });
 
-    const decRows = allRows.filter((r) => r.key === 'decision');
-    const totalPortfolio = decRows.reduce((acc, r) => acc + r.totalBefore, 0);
-    const stableApps = decRows.reduce((acc, r) => acc + r.stableCount, 0);
-    const flippedApps = decRows.reduce((acc, r) => acc + r.leftCount, 0);
+    const decRows = allRows.filter((r) => (r.key || '').toLowerCase().includes('decision') || (r.class || '').toLowerCase().includes('decision'));
+    const primaryClass = decRows.length > 0 ? decRows[0].class : (allRows[0]?.class || 'decisionResult');
+    const primaryDecRows = allRows.filter((r) => r.class === primaryClass);
 
-    const decisionTable = decRows.map((r) => ({
+    const totalPortfolio = primaryDecRows.reduce((acc, r) => acc + r.totalBefore, 0);
+    const stableApps = primaryDecRows.reduce((acc, r) => acc + r.stableCount, 0);
+    const flippedApps = primaryDecRows.reduce((acc, r) => acc + r.leftCount, 0);
+
+    const approveRow = primaryDecRows.find((r) => String(r.value).toUpperCase() === 'APPROVE') || {
+      totalBefore: 0,
+      totalAfter: 0,
+      stableCount: 0,
+      leftCount: 0,
+      arrivedCount: 0
+    };
+    const rejectRow = primaryDecRows.find((r) => String(r.value).toUpperCase() === 'REJECT') || {
+      totalBefore: 0,
+      totalAfter: 0,
+      stableCount: 0,
+      leftCount: 0,
+      arrivedCount: 0
+    };
+
+    const rateBefore = totalPortfolio > 0 ? ((approveRow.totalBefore / totalPortfolio) * 100).toFixed(1) : '0.0';
+    const rateAfter = totalPortfolio > 0 ? ((approveRow.totalAfter / totalPortfolio) * 100).toFixed(1) : '0.0';
+    const rateDiffNum = Number((Number(rateAfter) - Number(rateBefore)).toFixed(1));
+
+    const decisionTable = (decRows.length > 0 ? decRows : primaryDecRows).map((r) => ({
       ...r,
       shareBefore: totalPortfolio > 0 ? ((r.totalBefore / totalPortfolio) * 100).toFixed(1) : '0.0',
       shareAfter: totalPortfolio > 0 ? ((r.totalAfter / totalPortfolio) * 100).toFixed(1) : '0.0',
       shareDiff: totalPortfolio > 0 ? (((r.totalAfter - r.totalBefore) / totalPortfolio) * 100).toFixed(1) : '0.0'
     }));
 
+    const allUniqueParams = new Set();
+    const affectedUniqueParams = new Set();
     const groupsMap = {};
+
     allRows.forEach((row) => {
+      const paramKey = `${row.class}.${row.arrayKey}.${row.key}`;
+      allUniqueParams.add(paramKey);
+      if (row.totalChanges > 0) {
+        affectedUniqueParams.add(paramKey);
+      }
+
       if (!groupsMap[row.class]) {
         groupsMap[row.class] = {
           className: row.class,
-          totalDiffEvents: 0,
+          paramSet: new Set(),
+          affectedParamSet: new Set(),
+          maxAffectedClients: 0,
           rowsCount: 0,
+          totalDiffChanges: 0,
           rows: []
         };
       }
-      groupsMap[row.class].rows.push(row);
-      groupsMap[row.class].rowsCount += 1;
-      groupsMap[row.class].totalDiffEvents += row.totalChanges;
+      const grp = groupsMap[row.class];
+      grp.rows.push(row);
+      grp.rowsCount += 1;
+      grp.totalDiffChanges += row.totalChanges;
+      grp.paramSet.add(paramKey);
+      if (row.totalChanges > 0) {
+        grp.affectedParamSet.add(paramKey);
+      }
+      if (row.affectedClientsInBucket > grp.maxAffectedClients) {
+        grp.maxAffectedClients = row.affectedClientsInBucket;
+      }
     });
 
-    const approveRow = decisionTable.find((r) => r.value === 'APPROVE') || { shareBefore: '0.0', shareAfter: '0.0', shareDiff: '0.0' };
+    const groupedBlocks = Object.values(groupsMap).map((g) => ({
+      className: g.className,
+      totalParams: g.paramSet.size,
+      affectedParams: g.affectedParamSet.size,
+      maxAffectedClients: g.maxAffectedClients,
+      totalDiffChanges: g.totalDiffChanges,
+      rowsCount: g.rowsCount,
+      rows: g.rows
+    }));
+
+    const dynamicGates = groupedBlocks.slice(0, 5).map((block, idx) => {
+      const changedRows = block.rows.filter((r) => r.totalChanges > 0);
+      const topShift = changedRows.reduce((max, r) => Math.max(max, r.affectedClientsInBucket), 0);
+      const isDecision = block.className === primaryClass;
+
+      let ruleName = `Контроль модуля «${block.className}»`;
+      let threshold = 'Δ ≤ 5% сдвига';
+      let status = 'PASS';
+      let metric = `${changedRows.length} изменившихся бакетов`;
+
+      if (isDecision) {
+        ruleName = 'Контроль стабильности уровня одобрения (Approval Rate)';
+        threshold = 'Δ AR ≥ -2.0%';
+        metric = `${rateBefore}% → ${rateAfter}% (${rateDiffNum > 0 ? '+' : ''}${rateDiffNum}%)`;
+        status = rateDiffNum >= -2.0 ? 'PASS' : 'FAIL';
+      } else {
+        status = block.totalDiffChanges === 0 || topShift < 30 ? 'PASS' : 'FAIL';
+        metric = changedRows.length > 0 ? `Макс. переток: ${topShift} анкет` : 'Полное совпадение (0 расхождений)';
+      }
+
+      return {
+        id: `gate-auto-${idx}`,
+        name: `${idx + 1}. ${ruleName}`,
+        targetClass: block.className,
+        argument: changedRows[0]?.key || block.className,
+        threshold,
+        metric,
+        affectedCount: topShift,
+        status,
+        codeSnippet: `def check_${block.className.toLowerCase()}(mart_df):\n    # Проверка отклонения по модулю ${block.className}\n    diff_rows = mart_df.filter(class_name="${block.className}", diff_flag=1)\n    return {"status": "${status}", "count": ${topShift}}\n`
+      };
+    });
 
     return {
       decisionSummaryRows: decisionTable,
-      groupedParameterBlocks: Object.values(groupsMap),
+      groupedParameterBlocks: groupedBlocks,
+      qualityGates: [...dynamicGates, ...(currentWorkspace.customChecks || [])],
+      transitionMatrix: {
+        approveStable: approveRow.stableCount,
+        approveLost: approveRow.leftCount,
+        approveGained: approveRow.arrivedCount,
+        rejectStable: rejectRow.stableCount,
+        rejectLost: rejectRow.leftCount,
+        rejectGained: rejectRow.arrivedCount
+      },
       summaryMetrics: {
+        primaryClass,
         totalPortfolio,
         stableApps,
         flippedApps,
-        rateBefore: approveRow.shareBefore,
-        rateAfter: approveRow.shareAfter,
-        rateDiff: Number(approveRow.shareDiff) > 0 ? `+${approveRow.shareDiff}%` : `${approveRow.shareDiff}%`,
-        totalRows: allRows.length
+        rateBefore,
+        rateAfter,
+        rateDiff: rateDiffNum > 0 ? `+${rateDiffNum}%` : `${rateDiffNum}%`,
+        totalRows: allRows.length,
+        totalUniqueParams: allUniqueParams.size,
+        affectedUniqueParams: affectedUniqueParams.size
       }
     };
-  }, [combinedPivotFacts]);
+  }, [combinedPivotFacts, currentWorkspace.customChecks]);
 
+  // Фильтрация блоков параметров
   const displayedBlocks = useMemo(() => {
     const q = (currentWorkspace.searchFilter || '').toLowerCase();
 
@@ -287,14 +595,16 @@ export default function App() {
               row.class.toLowerCase().includes(q) ||
               row.arrayKey.toLowerCase().includes(q) ||
               row.key.toLowerCase().includes(q) ||
-              row.value.toLowerCase().includes(q);
+              String(row.value).toLowerCase().includes(q);
             if (!match) return false;
           }
           return true;
         });
 
         if (currentWorkspace.sortByImpact) {
-          filteredRows = [...filteredRows].sort((a, b) => b.totalChanges - a.totalChanges || b.absDelta - a.absDelta);
+          filteredRows = [...filteredRows].sort(
+            (a, b) => b.affectedClientsInBucket - a.affectedClientsInBucket || b.absDelta - a.absDelta
+          );
         }
 
         return { ...block, rows: filteredRows };
@@ -302,59 +612,16 @@ export default function App() {
       .filter((block) => block.rows.length > 0);
   }, [groupedParameterBlocks, currentWorkspace.onlyDiffRows, currentWorkspace.searchFilter, currentWorkspace.sortByImpact]);
 
-  // ── 3. СТРОГАЯ ФИЛЬТРАЦИЯ ЗАЯВОК ПО НАПРАВЛЕНИЮ («УШЛО» ИЛИ «ПРИШЛО») ──
+  // Фильтрация реестра заявок по активному срезу витрины
   const filteredApps = useMemo(() => {
-    return registeredAppList
-      .map((app) => {
-        if (selectedTransitionFilter !== 'ALL' && app.transition !== selectedTransitionFilter) {
-          return null;
-        }
-
-        if (!selectedPivotFilter) {
-          return { ...app, matchedContext: null };
-        }
-
-        const matchedRow = app.rawRows.find((r) => {
-          if (r.CLASS !== selectedPivotFilter.class) return false;
-          if (selectedPivotFilter.arrayKey && r.ARRAY_KEY !== selectedPivotFilter.arrayKey) return false;
-          if (selectedPivotFilter.key && r.KEY !== selectedPivotFilter.key) return false;
-
-          const isRowDiff = String(r.DIFF_FLAG) === '1';
-          if (!isRowDiff) return false;
-
-          const val = selectedPivotFilter.value;
-          const beforeVal = r.ADJUSTED_BEFORE || r.VALUE_BEFORE || r.ARRAY_KEY || '';
-          const afterVal = r.ADJUSTED_AFTER || r.VALUE_AFTER || r.ARRAY_KEY || '';
-
-          if (selectedPivotFilter.direction === 'LEFT') {
-            return beforeVal === val;
-          }
-          if (selectedPivotFilter.direction === 'ARRIVED') {
-            return afterVal === val;
-          }
-          return beforeVal === val || afterVal === val;
-        });
-
-        if (!matchedRow) return null;
-
-        const beforeVal = matchedRow.ADJUSTED_BEFORE || matchedRow.VALUE_BEFORE || '—';
-        const afterVal = matchedRow.ADJUSTED_AFTER || matchedRow.VALUE_AFTER || '—';
-
-        return {
-          ...app,
-          matchedContext: {
-            path: matchedRow.ARRAY_KEY ? `${matchedRow.ARRAY_KEY}.${matchedRow.KEY}` : matchedRow.KEY || matchedRow.CLASS,
-            before: beforeVal,
-            after: afterVal,
-            directionLabel:
-              selectedPivotFilter.direction === 'LEFT'
-                ? `Ушла из «${selectedPivotFilter.value}»`
-                : `Пришла в «${selectedPivotFilter.value}»`
-          }
-        };
-      })
-      .filter(Boolean);
-  }, [registeredAppList, selectedPivotFilter, selectedTransitionFilter]);
+    return registeredAppList.filter((app) => {
+      if (!selectedPivotFilter) return true;
+      if (selectedPivotFilter.value && app.afterDecision === selectedPivotFilter.value) {
+        return true;
+      }
+      return false;
+    });
+  }, [registeredAppList, selectedPivotFilter]);
 
   const handleDrillDown = (row, direction) => {
     const expectedCount = direction === 'LEFT' ? row.leftCount : row.arrivedCount;
@@ -368,8 +635,7 @@ export default function App() {
       direction,
       expectedCount
     });
-    setSelectedTransitionFilter('ALL');
-    setActiveTab('registry');
+    setExpandedSegmentClass(`${row.class}__${row.value}`);
   };
 
   const handleTogglePivotReview = (rowId, status) => {
@@ -412,25 +678,36 @@ export default function App() {
     setCollapsedClasses((prev) => ({ ...prev, [className]: !prev[className] }));
   };
 
-  const handleAddRule = (e) => {
+  // Открытие редактора кода
+  const openCodeModal = (title, code, readOnly = true, onSave = null) => {
+    setCodeEditorModal({
+      isOpen: true,
+      title,
+      code,
+      readOnly,
+      onSave
+    });
+  };
+
+  const handleAddCustomCheck = (e) => {
     e.preventDefault();
-    if (!newRuleClass.trim()) return;
-    const rule = {
-      PREFIX: 'company',
-      CLASS: newRuleClass.trim(),
-      ARRAY_KEY: 'CUSTOM',
-      KEY: newRuleKey.trim() || 'rule_check',
-      VALUE_ADJUSTED: 'TRIGGERED',
-      DIFF_FLAG: '1',
-      SOURCE: 'AFTER (BETA)',
-      CNT: 5
+    if (!newCheckName.trim()) return;
+    const newGate = {
+      id: `custom-${Date.now()}`,
+      name: newCheckName.trim(),
+      targetClass: newCheckClass.trim() || 'decisionResult',
+      argument: newCheckArg.trim() || 'custom_param',
+      threshold: newCheckThreshold.trim() || '0 расхождений',
+      metric: 'Пользовательское правило',
+      affectedCount: 0,
+      status: 'PASS',
+      codeSnippet: newCheckCode
     };
     updateCurrentWorkspace({
-      customRules: [...(currentWorkspace.customRules || []), rule]
+      customChecks: [...(currentWorkspace.customChecks || []), newGate]
     });
-    setNewRuleClass('');
-    setNewRuleKey('');
-    setIsRuleModalOpen(false);
+    setNewCheckName('');
+    setIsCheckModalOpen(false);
   };
 
   const handleCreateUser = (e) => {
@@ -440,7 +717,15 @@ export default function App() {
     if (!workspaces[label]) {
       setWorkspaces((prev) => ({
         ...prev,
-        [label]: { onlyDiffRows: false, searchFilter: '', sortByImpact: true, customRules: [], pivotReviews: {}, appReviews: {} }
+        [label]: {
+          onlyDiffRows: false,
+          searchFilter: '',
+          sortByImpact: true,
+          customRules: [],
+          customChecks: [],
+          pivotReviews: {},
+          appReviews: {}
+        }
       }));
     }
     setCurrentUser(label);
@@ -451,43 +736,51 @@ export default function App() {
   return (
     <div className="min-h-screen bg-slate-50/70 text-slate-900 font-sans flex flex-col">
       
-      {/* ── ВЕРХНЯЯ ПАНЕЛЬ С ПРЯМОЙ НАСТРОЙКОЙ URL БЭКЕНДА ── */}
+      {/* ── ШАПКА ── */}
       <header className="border-b border-slate-200 bg-white px-6 py-2.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30 shadow-xs">
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
             <span className={`w-2.5 h-2.5 rounded-full ${apiStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
-            <span className="font-bold text-sm tracking-tight text-slate-800">СПР • Анализ стратегий</span>
+            <span className="font-bold text-sm tracking-tight text-slate-800">СПР • Сравнение кредитных стратегий</span>
           </div>
 
           <nav className="flex gap-1 bg-slate-100 p-1 rounded-lg">
             <button
+              onClick={() => setActiveTab('run')}
+              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 ${
+                activeTab === 'run' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <span>▶ Запуск и пайплайн</span>
+              {isPipelineRunning && <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping"></span>}
+            </button>
+            <button
               onClick={() => setActiveTab('matrix')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
+              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
                 activeTab === 'matrix' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Сводная витрина ({summaryMetrics.totalRows})
+              Сводный отчёт ({summaryMetrics.totalRows})
             </button>
             <button
               onClick={() => setActiveTab('registry')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition ${
+              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
                 activeTab === 'registry' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
-              Примеры заявок в CSV ({filteredApps.length}/{registeredAppList.length})
+              Реестр заявок ({registeredAppList.length} шт.)
             </button>
           </nav>
 
-          {/* Панель прямого подключения к FastAPI (без прокси) */}
+          {/* Подключение к FastAPI */}
           <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-xs">
-            <span className="text-slate-400 font-medium">API:</span>
+            <span className="text-slate-400 font-medium">FastAPI:</span>
             <input
               type="text"
               value={backendUrl}
               onChange={(e) => setBackendUrl(e.target.value)}
               placeholder="http://localhost:8000"
-              className="bg-white border border-slate-300 rounded px-2 py-0.5 text-xs font-mono w-44 outline-none focus:border-blue-500"
-              title="Адрес FastAPI сервера (например http://localhost:8000 или http://192.168.1.45:8000)"
+              className="bg-white border border-slate-300 rounded px-2 py-0.5 text-xs font-mono w-36 outline-none focus:border-blue-500"
             />
             <span className="text-slate-400">#</span>
             <input
@@ -495,25 +788,24 @@ export default function App() {
               value={reportId}
               onChange={(e) => setReportId(e.target.value)}
               className="bg-white border border-slate-300 rounded px-1.5 py-0.5 text-xs font-mono w-8 text-center outline-none focus:border-blue-500"
-              title="ID отчёта (/api/reports/{id}/pivot-facts)"
+              title="ID прогона отчёта"
             />
             <button
-              onClick={() => fetchPivotFactsDirect(backendUrl, reportId)}
+              onClick={() => fetchBackendData(backendUrl, reportId)}
               className="px-2 py-0.5 bg-slate-900 hover:bg-blue-600 text-white rounded font-semibold transition cursor-pointer"
-              title="Загрузить данные напрямую с указанного сервера"
+              title="Обновить данные с бэкенда"
             >
               {isLoadingApi ? '...' : '↻'}
             </button>
             <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-              apiStatus === 'connected'
-                ? 'bg-emerald-100 text-emerald-800'
-                : 'bg-amber-100 text-amber-800'
+              apiStatus === 'connected' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
             }`}>
-              {apiStatus === 'connected' ? 'ONLINE' : 'DEMO JSON'}
+              {apiStatus === 'connected' ? `RUN #${reportId} ONLINE` : 'DEMO'}
             </span>
           </div>
         </div>
 
+        {/* Пользователь и действия */}
         <div className="flex items-center gap-2.5">
           <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1 text-xs shadow-xs">
             <span className="text-slate-400">👤</span>
@@ -530,399 +822,891 @@ export default function App() {
 
           <button
             onClick={() => setNewUserModalOpen(true)}
-            className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition"
+            className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
           >
             + Аналитик
           </button>
 
           <button
-            onClick={() => setIsRuleModalOpen(true)}
-            className="px-3 py-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs"
+            onClick={() => setIsCheckModalOpen(true)}
+            className="px-3 py-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs cursor-pointer"
           >
-            + Своё правило
+            + Автопроверка
           </button>
         </div>
       </header>
 
       {/* ── ОСНОВНОЙ КОНТЕНТ ── */}
       <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-6">
-        
-        {/* 1. СВОДНЫЙ БАЛАНС ПО ИТОГОВЫМ РЕШЕНИЯМ */}
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-          <div className="px-5 py-3.5 bg-slate-900 text-white flex flex-wrap justify-between items-center gap-2">
-            <div>
-              <h2 className="text-sm font-bold">Сводный баланс портфеля по итоговым решениям (MASTER vs BETA)</h2>
-              <p className="text-[11px] text-slate-300">
-                Всего в выборке: {summaryMetrics.totalPortfolio} заявок • Стабильных (DIFF=0): {summaryMetrics.stableApps} • Изменили решение (Flip): {summaryMetrics.flippedApps}
-              </p>
-            </div>
-            <div className="flex items-center gap-3 text-xs">
-              <span className="bg-white/10 px-2.5 py-1 rounded-md">
-                Одобрение: <b>{summaryMetrics.rateBefore}% → {summaryMetrics.rateAfter}%</b> ({summaryMetrics.rateDiff})
-              </span>
-            </div>
-          </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
-                <tr>
-                  <th className="py-2.5 px-4 font-semibold">Итоговое решение</th>
-                  <th className="py-2.5 px-4 font-semibold text-center">Было в MASTER</th>
-                  <th className="py-2.5 px-4 font-semibold text-center text-slate-500">Сохранилось (DIFF=0)</th>
-                  <th className="py-2.5 px-4 font-semibold text-center text-rose-700 bg-rose-50/40">Ушло из решения (Клик →)</th>
-                  <th className="py-2.5 px-4 font-semibold text-center text-emerald-700 bg-emerald-50/40">Пришло в решение (Клик →)</th>
-                  <th className="py-2.5 px-4 font-semibold text-center">Стало в BETA</th>
-                  <th className="py-2.5 px-4 font-semibold text-center">Чистый итог (Δ)</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100 font-mono">
-                {decisionSummaryRows.map((row) => (
-                  <tr key={row.id} className="hover:bg-slate-50">
-                    <td className="py-2.5 px-4 font-bold text-slate-900">{row.value}</td>
-                    <td className="py-2.5 px-4 text-center text-slate-700">
-                      <b>{row.totalBefore}</b> <span className="text-slate-400">({row.shareBefore}%)</span>
-                    </td>
-                    <td className="py-2.5 px-4 text-center text-slate-500">{row.stableCount}</td>
-
-                    <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans">
-                      {row.leftCount > 0 ? (
-                        <button
-                          onClick={() => handleDrillDown(row, 'LEFT')}
-                          className="px-2.5 py-1 rounded bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800 font-mono font-bold text-xs transition cursor-pointer shadow-2xs"
-                        >
-                          -{row.leftCount} →
-                        </button>
-                      ) : (
-                        <span className="text-slate-300">0</span>
-                      )}
-                    </td>
-
-                    <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans">
-                      {row.arrivedCount > 0 ? (
-                        <button
-                          onClick={() => handleDrillDown(row, 'ARRIVED')}
-                          className="px-2.5 py-1 rounded bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800 font-mono font-bold text-xs transition cursor-pointer shadow-2xs"
-                        >
-                          +{row.arrivedCount} →
-                        </button>
-                      ) : (
-                        <span className="text-slate-300">0</span>
-                      )}
-                    </td>
-
-                    <td className="py-2.5 px-4 text-center text-slate-900">
-                      <b>{row.totalAfter}</b> <span className="text-slate-400">({row.shareAfter}%)</span>
-                    </td>
-                    <td className="py-2.5 px-4 text-center font-sans font-bold">
-                      {row.netDelta > 0 ? (
-                        <span className="bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">+{row.netDelta} ({row.shareDiff}%)</span>
-                      ) : row.netDelta < 0 ? (
-                        <span className="bg-rose-100 text-rose-800 px-2 py-0.5 rounded">{row.netDelta} ({row.shareDiff}%)</span>
-                      ) : (
-                        <span className="text-slate-400">0 (0.0%)</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-
-        {/* ── ЭКРАН 1: СВОРАЧИВАЕМЫЕ БЛОКИ ПАРАМЕТРОВ ── */}
-        {activeTab === 'matrix' && (
-          <div className="space-y-4">
-            <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap justify-between items-center gap-3">
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="text"
-                  placeholder="Быстрый фильтр по классу, ключу или бакету..."
-                  value={currentWorkspace.searchFilter}
-                  onChange={(e) => updateCurrentWorkspace({ searchFilter: e.target.value })}
-                  className="bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-1.5 text-xs outline-none focus:border-blue-500 w-72"
-                />
-                <button
-                  onClick={() => updateCurrentWorkspace({ onlyDiffRows: !currentWorkspace.onlyDiffRows })}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition ${
-                    currentWorkspace.onlyDiffRows 
-                      ? 'bg-amber-500 text-white border-amber-500' 
-                      : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
-                  }`}
-                >
-                  {currentWorkspace.onlyDiffRows ? '● Только с расхождениями' : '○ Все бакеты'}
-                </button>
-                <button
-                  onClick={() => updateCurrentWorkspace({ sortByImpact: !currentWorkspace.sortByImpact })}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition ${
-                    currentWorkspace.sortByImpact 
-                      ? 'bg-slate-800 text-white border-slate-800' 
-                      : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
-                  }`}
-                >
-                  {currentWorkspace.sortByImpact ? '↓ Сортировка по масштабу сдвига' : 'Сортировка по порядку'}
-                </button>
+        {/* ── ВКЛАДКА: ЗАПУСК БЭКТЕСТА И ТРЕКЕР ПАЙПЛАЙНА ── */}
+        {activeTab === 'run' && (
+          <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
+            
+            {/* Левая колонка: форма конфигурации */}
+            <div className="md:col-span-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
+              <div className="border-b border-slate-100 pb-3">
+                <h2 className="text-base font-bold text-slate-800">Конфигурация бэктеста</h2>
+                <p className="text-xs text-slate-500">
+                  Запуск пайплайна нормализации и сопоставления срезов через <code>POST /api/runs/</code>
+                </p>
               </div>
 
-              <div className="text-xs text-slate-500">
-                Проверено строк в профиле: <b>{Object.keys(currentWorkspace.pivotReviews || {}).length}</b>
-              </div>
-            </div>
-
-            {displayedBlocks.map((block) => {
-              const isCollapsed = !!collapsedClasses[block.className];
-              return (
-                <div key={block.className} className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-                  <div
-                    onClick={() => toggleClassCollapse(block.className)}
-                    className="px-5 py-3 bg-slate-50/80 hover:bg-slate-100/80 border-b border-slate-200 flex justify-between items-center cursor-pointer transition"
+              <div className="space-y-3 text-xs">
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Выбор пула ретро-заявок (Датасет)</label>
+                  <select 
+                    value={runConfig.dataset}
+                    onChange={(e) => setRunConfig({ ...runConfig, dataset: e.target.value })}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-mono text-slate-800 outline-none focus:border-blue-500"
                   >
-                    <div className="flex items-center gap-3">
-                      <span className="text-xs font-bold text-slate-400">{isCollapsed ? '▶' : '▼'}</span>
-                      <span className="font-bold text-sm text-slate-800">{block.className}</span>
-                      <span className="text-xs text-slate-500">({block.rows.length} строк)</span>
-                    </div>
-                    <span className={`text-xs font-bold px-2 py-0.5 rounded ${
-                      block.totalDiffEvents > 0 ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
-                    }`}>
-                      Событий DIFF=1: {block.totalDiffEvents}
-                    </span>
-                  </div>
-
-                  {!isCollapsed && (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left text-xs">
-                        <thead className="bg-white text-slate-500 border-b border-slate-100">
-                          <tr>
-                            <th className="py-2 px-4 font-semibold">Параметр (ARRAY_KEY / KEY)</th>
-                            <th className="py-2 px-4 font-semibold">Бакет (VALUE_ADJUSTED)</th>
-                            <th className="py-2 px-4 font-semibold text-center">DIFF=0</th>
-                            <th className="py-2 px-4 font-semibold text-center text-rose-700">Ушло (BEFORE)</th>
-                            <th className="py-2 px-4 font-semibold text-center text-emerald-700">Пришло (AFTER)</th>
-                            <th className="py-2 px-4 font-semibold text-center">Дельта (Δ)</th>
-                            <th className="py-2 px-4 font-semibold">Вердикт по правилу</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100 font-mono">
-                          {block.rows.map((row) => {
-                            const hasDiff = row.totalChanges > 0;
-                            const ruleReview = (currentWorkspace.pivotReviews || {})[row.id];
-
-                            return (
-                              <tr key={row.id} className={hasDiff ? 'bg-amber-50/20 hover:bg-amber-50/50' : 'hover:bg-slate-50'}>
-                                <td className="py-2 px-4 text-slate-700 font-medium">
-                                  {row.arrayKey ? `${row.arrayKey}${row.key ? '.' + row.key : ''}` : row.key || '—'}
-                                </td>
-                                <td className="py-2 px-4 font-bold text-slate-900">{row.value}</td>
-                                <td className="py-2 px-4 text-center text-slate-500">{row.stableCount}</td>
-
-                                <td className="py-2 px-4 text-center font-sans">
-                                  {row.leftCount > 0 ? (
-                                    <button
-                                      onClick={() => handleDrillDown(row, 'LEFT')}
-                                      className="px-2 py-0.5 rounded bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-700 border border-rose-200 font-mono font-bold transition"
-                                    >
-                                      -{row.leftCount} →
-                                    </button>
-                                  ) : (
-                                    <span className="text-slate-300">0</span>
-                                  )}
-                                </td>
-
-                                <td className="py-2 px-4 text-center font-sans">
-                                  {row.arrivedCount > 0 ? (
-                                    <button
-                                      onClick={() => handleDrillDown(row, 'ARRIVED')}
-                                      className="px-2 py-0.5 rounded bg-emerald-50 hover:bg-emerald-600 hover:text-white text-emerald-700 border border-emerald-200 font-mono font-bold transition"
-                                    >
-                                      +{row.arrivedCount} →
-                                    </button>
-                                  ) : (
-                                    <span className="text-slate-300">0</span>
-                                  )}
-                                </td>
-
-                                <td className="py-2 px-4 text-center font-sans font-bold">
-                                  {row.netDelta > 0 ? (
-                                    <span className="text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">+{row.netDelta}</span>
-                                  ) : row.netDelta < 0 ? (
-                                    <span className="text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">{row.netDelta}</span>
-                                  ) : (
-                                    <span className="text-slate-400">0</span>
-                                  )}
-                                </td>
-                                <td className="py-2 px-4 font-sans">
-                                  {hasDiff ? (
-                                    <div className="flex items-center gap-1">
-                                      {['OK', 'Вопрос', 'Баг'].map((status) => {
-                                        const isActive = ruleReview?.status === status;
-                                        return (
-                                          <button
-                                            key={status}
-                                            onClick={() => handleTogglePivotReview(row.id, status)}
-                                            className={`px-2 py-0.5 rounded text-[10px] font-bold border transition ${
-                                              isActive
-                                                ? 'bg-blue-600 text-white border-blue-600'
-                                                : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
-                                            }`}
-                                          >
-                                            {status}
-                                          </button>
-                                        );
-                                      })}
-                                    </div>
-                                  ) : (
-                                    <span className="text-[10px] text-slate-400">Стабильно</span>
-                                  )}
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
+                    <option value="RUN-20260827-0001 (2002 заявки, 2 среза)">RUN-20260827-0001 (4004 файла BEFORE/AFTER)</option>
+                    <option value="RUN-20260901-0042 (500 заявок, ипотека)">RUN-20260901-0042 (1000 файлов)</option>
+                  </select>
                 </div>
-              );
-            })}
+
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="font-medium text-slate-700">Процедура нормализации (Скрипт)</label>
+                    <button
+                      onClick={() => openCodeModal('normalizer_dynamic.py', PIPELINE_STEP_CODES.normalize, false, (newCode) => {
+                        PIPELINE_STEP_CODES.normalize = newCode;
+                      })}
+                      className="text-blue-600 hover:underline font-semibold cursor-pointer"
+                    >
+                      Редактировать код →
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={runConfig.normalizer}
+                    onChange={(e) => setRunConfig({ ...runConfig, normalizer: e.target.value })}
+                    className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-mono text-slate-800"
+                  />
+                </div>
+
+                <div>
+                  <label className="block font-medium text-slate-700 mb-1">Исполняемые правила риск-политики</label>
+                  <div className="space-y-1 bg-slate-50 border border-slate-200 rounded-lg p-3">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" defaultChecked className="rounded text-blue-600" />
+                      <span>Approval Rate & Flips (дельта одобрения портфеля)</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" defaultChecked className="rounded text-blue-600" />
+                      <span>Контроль стоп-факторов (отсечки возраста, просрочек)</span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input type="checkbox" defaultChecked className="rounded text-blue-600" />
+                      <span>Сдвиг порогов скоркарт (cutOff PD_RETAIL, TAKEUP)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div className="pt-2">
+                  <button
+                    onClick={handleStartPipelineRun}
+                    disabled={isPipelineRunning}
+                    className="w-full py-2.5 px-4 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {isPipelineRunning ? (
+                      <>
+                        <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                        <span>Выполняется расчет пайплайна...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span>▶ Запустить сравнение кредитных стратегий</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Правая колонка: живой трекер этапов */}
+            <div className="md:col-span-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
+              <div className="flex justify-between items-center border-b border-slate-100 pb-3">
+                <div>
+                  <h2 className="text-base font-bold text-slate-800">Журнал этапов пайплайна</h2>
+                  <p className="text-xs text-slate-500">
+                    Опрос статусов через <code>GET /api/runs/{'{id}'}/steps</code>
+                  </p>
+                </div>
+                <span className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                  isPipelineRunning ? 'bg-amber-100 text-amber-800 animate-pulse' : 'bg-emerald-100 text-emerald-800'
+                }`}>
+                  {isPipelineRunning ? 'В ПРОЦЕССЕ' : 'ГОТОВ (ID: #' + reportId + ')'}
+                </span>
+              </div>
+
+              <div className="space-y-3">
+                {pipelineSteps.map((step) => {
+                  const isDone = step.status === 'done';
+                  const isRunning = step.status === 'running';
+
+                  return (
+                    <div
+                      key={step.id}
+                      className={`p-3 rounded-xl border transition flex items-center justify-between text-xs ${
+                        isRunning 
+                          ? 'bg-blue-50/60 border-blue-200' 
+                          : isDone 
+                          ? 'bg-slate-50 border-slate-200' 
+                          : 'bg-white border-slate-100 opacity-60'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5">
+                        <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                          isDone 
+                            ? 'bg-emerald-600 text-white' 
+                            : isRunning 
+                            ? 'bg-blue-600 text-white animate-spin' 
+                            : 'bg-slate-200 text-slate-500'
+                        }`}>
+                          {isDone ? '✓' : isRunning ? '⟳' : '○'}
+                        </span>
+                        <div>
+                          <div className="font-semibold text-slate-800">{step.name}</div>
+                          <div className="text-[10px] text-slate-400">Время: {step.time}</div>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => openCodeModal(
+                          `Код этапа: ${step.name}`,
+                          PIPELINE_STEP_CODES[step.id] || '# Исходный код этапа выполняется на сервере\n',
+                          true
+                        )}
+                        className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 font-semibold transition cursor-pointer text-[11px]"
+                      >
+                        Код этапа ↗
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <div className="bg-slate-50 p-3 rounded-xl border border-slate-200 text-xs text-slate-600 flex justify-between items-center">
+                <span>Результаты автоматически подтянутся в Сводный отчёт</span>
+                <button
+                  onClick={() => setActiveTab('matrix')}
+                  className="font-bold text-blue-600 hover:underline cursor-pointer"
+                >
+                  Перейти к витрине →
+                </button>
+              </div>
+            </div>
+
           </div>
         )}
 
-        {/* ── ЭКРАН 2: РЕЕСТР ЗАЯВОК ── */}
+        {/* ── ВКЛАДКА: СВОДНЫЙ ОТЧЁТ И ВИТРИНА ── */}
+        {activeTab === 'matrix' && (
+          <div className="space-y-6">
+            
+            {/* 1. КАРТОЧКИ БИЗНЕС-МЕТРИК ПОРТФЕЛЯ */}
+            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+                <div className="text-xs font-medium text-slate-500 mb-1">Уровень одобрения (APPROVE)</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-slate-900">{summaryMetrics.rateAfter}%</div>
+                  <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                    {summaryMetrics.rateDiff}
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400 mt-1">
+                  MASTER: {summaryMetrics.rateBefore}% • Портфель: {summaryMetrics.totalPortfolio} анкет
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+                <div className="text-xs font-medium text-slate-500 mb-1">Смена решения (Flip)</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-slate-900">{summaryMetrics.flippedApps}</div>
+                  <span className="text-xs font-semibold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                    DIFF=1
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400 mt-1">
+                  Стабильное решение: {summaryMetrics.stableApps} клиентов
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+                <div className="text-xs font-medium text-slate-500 mb-1">Загружено заявок в реестр</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-blue-600">
+                    {registeredAppList.length}
+                  </div>
+                  <span className="text-xs font-semibold text-blue-800 bg-blue-50 px-1.5 py-0.5 rounded">
+                    из базы FastAPI
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400 mt-1">
+                  Все ID доступны для открытия досье
+                </div>
+              </div>
+
+              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
+                <div className="text-xs font-medium text-slate-500 mb-1">Баланс перетока одобрений</div>
+                <div className="flex items-baseline justify-between">
+                  <div className="text-2xl font-bold tracking-tight text-emerald-600">
+                    +{transitionMatrix.approveGained} <span className="text-rose-600 text-lg">/ -{transitionMatrix.approveLost}</span>
+                  </div>
+                  <span className="text-xs font-semibold text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded">
+                    Приток / Отсев
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400 mt-1">
+                  Чистая дельта: +{transitionMatrix.approveGained - transitionMatrix.approveLost} одобрений
+                </div>
+              </div>
+            </div>
+
+            {/* 2. ДИНАМИЧЕСКИЙ БЛОК АВТОПРОВЕРОК (QUALITY GATES) */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+              <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex flex-wrap justify-between items-center gap-2">
+                <div>
+                  <h2 className="text-sm font-bold text-slate-800">Автоматические проверки стратегии (Quality Gates)</h2>
+                  <p className="text-[11px] text-slate-500">
+                    Сформированы по фактам отчёта #{reportId}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                    PASS: {qualityGates.filter((g) => g.status === 'PASS').length}
+                  </span>
+                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-rose-100 text-rose-800">
+                    FAIL: {qualityGates.filter((g) => g.status === 'FAIL').length}
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-white text-slate-500 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-4 font-semibold">Контрольная проверка</th>
+                      <th className="py-2.5 px-4 font-semibold">Модуль (PREFIX / CLASS)</th>
+                      <th className="py-2.5 px-4 font-semibold">Порог контроля</th>
+                      <th className="py-2.5 px-4 font-semibold">Факт по витрине</th>
+                      <th className="py-2.5 px-4 font-semibold text-center">Статус</th>
+                      <th className="py-2.5 px-4 font-semibold text-right">Действия</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {qualityGates.map((gate) => {
+                      const isSelected = selectedQualityGateId === gate.id;
+                      const matchingBlock = groupedParameterBlocks.find((b) => b.className === gate.targetClass);
+
+                      return (
+                        <React.Fragment key={gate.id}>
+                          <tr
+                            onClick={() => setSelectedQualityGateId(isSelected ? null : gate.id)}
+                            className={`cursor-pointer transition ${
+                              isSelected ? 'bg-blue-50/70' : 'hover:bg-slate-50'
+                            }`}
+                          >
+                            <td className="py-2.5 px-4 font-bold text-slate-800">
+                              <span className="mr-1.5 text-slate-400">{isSelected ? '▼' : '▶'}</span>
+                              {gate.name}
+                            </td>
+                            <td className="py-2.5 px-4 font-mono text-slate-600">
+                              <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px]">{gate.targetClass}</span>
+                            </td>
+                            <td className="py-2.5 px-4 text-slate-500">{gate.threshold}</td>
+                            <td className="py-2.5 px-4 font-mono font-semibold text-slate-900">{gate.metric}</td>
+                            <td className="py-2.5 px-4 text-center">
+                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                gate.status === 'PASS'
+                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                  : 'bg-rose-100 text-rose-800 border border-rose-200'
+                              }`}>
+                                {gate.status}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-4 text-right">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openCodeModal(`Логика проверки: ${gate.name}`, gate.codeSnippet || '# Код проверки\n', true);
+                                }}
+                                className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer mr-2"
+                              >
+                                Код ↗
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setSelectedQualityGateId(isSelected ? null : gate.id);
+                                }}
+                                className="text-[11px] text-blue-600 hover:underline font-semibold cursor-pointer"
+                              >
+                                {isSelected ? 'Скрыть ▲' : 'Срез ▼'}
+                              </button>
+                            </td>
+                          </tr>
+
+                          {isSelected && matchingBlock && (
+                            <tr>
+                              <td colSpan={6} className="p-4 bg-slate-50 border-y border-blue-200">
+                                <div className="bg-white rounded-xl border border-slate-200 p-3 space-y-2 shadow-xs">
+                                  <div className="flex justify-between items-center">
+                                    <span className="text-xs font-bold text-slate-800">
+                                      Параметры модуля «{matchingBlock.className}» ({matchingBlock.rows.length} строк):
+                                    </span>
+                                    <button
+                                      onClick={() => setSelectedQualityGateId(null)}
+                                      className="text-xs text-slate-400 hover:text-slate-700"
+                                    >
+                                      ✕ Закрыть
+                                    </button>
+                                  </div>
+                                  <table className="w-full text-left text-[11px] font-mono">
+                                    <thead className="bg-slate-50 text-slate-500 font-sans">
+                                      <tr>
+                                        <th className="py-1.5 px-3">Параметр (KEY)</th>
+                                        <th className="py-1.5 px-3">Бакет (VALUE)</th>
+                                        <th className="py-1.5 px-3 text-center">DIFF=0 (Стабильно)</th>
+                                        <th className="py-1.5 px-3 text-center text-rose-700">Ушло (BEFORE)</th>
+                                        <th className="py-1.5 px-3 text-center text-emerald-700">Пришло (AFTER)</th>
+                                        <th className="py-1.5 px-3 text-center">Чистый сдвиг (Δ)</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-slate-100">
+                                      {matchingBlock.rows.map((r) => (
+                                        <tr key={r.id} className={r.totalChanges > 0 ? 'bg-amber-50/40' : ''}>
+                                          <td className="py-1.5 px-3">{r.arrayKey ? `${r.arrayKey}.${r.key}` : r.key || '—'}</td>
+                                          <td className="py-1.5 px-3 font-bold">{r.value}</td>
+                                          <td className="py-1.5 px-3 text-center text-slate-500">{r.stableCount}</td>
+                                          <td className="py-1.5 px-3 text-center text-rose-600 font-bold">{r.leftCount > 0 ? `-${r.leftCount}` : '0'}</td>
+                                          <td className="py-1.5 px-3 text-center text-emerald-600 font-bold">{r.arrivedCount > 0 ? `+${r.arrivedCount}` : '0'}</td>
+                                          <td className="py-1.5 px-3 text-center font-bold">{r.netDelta > 0 ? `+${r.netDelta}` : r.netDelta}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 3. ТАБЛИЦА РЕШЕНИЙ С ИНЛАЙН MASTER-DETAIL */}
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+              <div className="px-5 py-3.5 bg-slate-900 text-white flex flex-wrap justify-between items-center gap-2">
+                <div>
+                  <h2 className="text-sm font-bold">Итоговые решения и сегменты модели</h2>
+                  <p className="text-[11px] text-slate-300">
+                    Клик по названию модуля или по кнопке перетока раскрывает параметры и заявки прямо под строкой
+                  </p>
+                </div>
+                {expandedSegmentClass && (
+                  <button
+                    onClick={() => {
+                      setExpandedSegmentClass(null);
+                      setSelectedPivotFilter(null);
+                    }}
+                    className="text-xs bg-white/15 hover:bg-white/25 text-white px-2.5 py-1 rounded transition cursor-pointer"
+                  >
+                    ✕ Свернуть срез
+                  </button>
+                )}
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                    <tr>
+                      <th className="py-2.5 px-4 font-semibold">Модуль / Сегмент</th>
+                      <th className="py-2.5 px-4 font-semibold">Исход (VALUE)</th>
+                      <th className="py-2.5 px-4 font-semibold text-center">MASTER</th>
+                      <th className="py-2.5 px-4 font-semibold text-center text-slate-500">DIFF=0 (Стабильно)</th>
+                      <th className="py-2.5 px-4 font-semibold text-center text-rose-700 bg-rose-50/40">Ушло (BEFORE)</th>
+                      <th className="py-2.5 px-4 font-semibold text-center text-emerald-700 bg-emerald-50/40">Пришло (AFTER)</th>
+                      <th className="py-2.5 px-4 font-semibold text-center">BETA</th>
+                      <th className="py-2.5 px-4 font-semibold text-center">Чистый итог (Δ)</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-mono">
+                    {decisionSummaryRows.map((row) => {
+                      const targetKey = `${row.class}__${row.value}`;
+                      const isRowExpanded = expandedSegmentClass === targetKey;
+                      const parentBlock = groupedParameterBlocks.find((b) => b.className === row.class);
+
+                      return (
+                        <React.Fragment key={row.id}>
+                          <tr
+                            onClick={() => {
+                              if (expandedSegmentClass === targetKey) {
+                                setExpandedSegmentClass(null);
+                                setSelectedPivotFilter(null);
+                              } else {
+                                setExpandedSegmentClass(targetKey);
+                                setSelectedPivotFilter({
+                                  class: row.class,
+                                  arrayKey: row.arrayKey,
+                                  key: row.key,
+                                  value: row.value,
+                                  direction: 'ALL',
+                                  expectedCount: row.leftCount + row.arrivedCount
+                                });
+                              }
+                            }}
+                            className={`cursor-pointer transition ${
+                              isRowExpanded ? 'bg-blue-50/70' : 'hover:bg-slate-50'
+                            }`}
+                          >
+                            <td className="py-2.5 px-4 font-sans font-medium text-slate-700">
+                              <span className="inline-flex items-center gap-1.5 bg-slate-100 hover:bg-blue-100 text-slate-800 px-2.5 py-1 rounded text-[11px] font-semibold transition">
+                                <span className="text-blue-600">{isRowExpanded ? '▼' : '▶'}</span>
+                                {row.class}{row.arrayKey ? ` • ${row.arrayKey}` : ''}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-4 font-bold text-slate-900">{row.value}</td>
+                            <td className="py-2.5 px-4 text-center text-slate-700 font-bold">{row.totalBefore}</td>
+                            <td className="py-2.5 px-4 text-center text-slate-500">{row.stableCount}</td>
+
+                            <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans" onClick={(e) => e.stopPropagation()}>
+                              {row.leftCount > 0 ? (
+                                <button
+                                  onClick={() => handleDrillDown(row, 'LEFT')}
+                                  className="px-2.5 py-0.5 rounded bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800 font-mono font-bold text-xs transition cursor-pointer"
+                                >
+                                  -{row.leftCount} ▼
+                                </button>
+                              ) : (
+                                <span className="text-slate-300">0</span>
+                              )}
+                            </td>
+
+                            <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans" onClick={(e) => e.stopPropagation()}>
+                              {row.arrivedCount > 0 ? (
+                                <button
+                                  onClick={() => handleDrillDown(row, 'ARRIVED')}
+                                  className="px-2.5 py-0.5 rounded bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800 font-mono font-bold text-xs transition cursor-pointer"
+                                >
+                                  +{row.arrivedCount} ▼
+                                </button>
+                              ) : (
+                                <span className="text-slate-300">0</span>
+                              )}
+                            </td>
+
+                            <td className="py-2.5 px-4 text-center text-slate-900 font-bold">{row.totalAfter}</td>
+                            <td className="py-2.5 px-4 text-center font-sans font-bold">
+                              {row.netDelta > 0 ? (
+                                <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">+{row.netDelta}</span>
+                              ) : row.netDelta < 0 ? (
+                                <span className="bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded">{row.netDelta}</span>
+                              ) : (
+                                <span className="text-slate-400">0</span>
+                              )}
+                            </td>
+                          </tr>
+
+                          {isRowExpanded && (
+                            <tr>
+                              <td colSpan={8} className="p-4 bg-blue-50/30 border-y border-blue-200 font-sans">
+                                <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-4 shadow-xs">
+                                  <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-100 pb-3">
+                                    <div>
+                                      <span className="text-xs font-bold uppercase tracking-wider text-blue-600">
+                                        Активный фильтр среза
+                                      </span>
+                                      <h4 className="text-sm font-bold text-slate-800">
+                                        {row.class} = {row.value}
+                                        {selectedPivotFilter?.direction === 'LEFT' && ' (Только ушедшие)'}
+                                        {selectedPivotFilter?.direction === 'ARRIVED' && ' (Только пришедшие)'}
+                                      </h4>
+                                    </div>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        onClick={() => setActiveTab('registry')}
+                                        className="px-3 py-1 bg-slate-900 hover:bg-blue-600 text-white rounded-lg text-xs font-semibold transition cursor-pointer"
+                                      >
+                                        Перейти в реестр ({filteredApps.length}) →
+                                      </button>
+                                      <button
+                                        onClick={() => {
+                                          setExpandedSegmentClass(null);
+                                          setSelectedPivotFilter(null);
+                                        }}
+                                        className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-semibold cursor-pointer"
+                                      >
+                                        ✕ Закрыть
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {parentBlock && (
+                                    <div>
+                                      <div className="text-xs font-semibold text-slate-600 mb-2">
+                                        Параметры модуля «{row.class}» ({parentBlock.rows.length} бакетов):
+                                      </div>
+                                      <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                                        <table className="w-full text-left text-xs font-mono">
+                                          <thead className="bg-slate-50 text-slate-500 font-sans border-b border-slate-200">
+                                            <tr>
+                                              <th className="py-1.5 px-3">Параметр (KEY)</th>
+                                              <th className="py-1.5 px-3">Бакет</th>
+                                              <th className="py-1.5 px-3 text-center">Стабильно</th>
+                                              <th className="py-1.5 px-3 text-center text-rose-700">Ушло</th>
+                                              <th className="py-1.5 px-3 text-center text-emerald-700">Пришло</th>
+                                              <th className="py-1.5 px-3 text-center">Дельта</th>
+                                            </tr>
+                                          </thead>
+                                          <tbody className="divide-y divide-slate-100">
+                                            {parentBlock.rows.map((subRow) => (
+                                              <tr
+                                                key={subRow.id}
+                                                className={subRow.value === row.value ? 'bg-blue-50/60 font-bold' : ''}
+                                              >
+                                                <td className="py-1.5 px-3">{subRow.arrayKey ? `${subRow.arrayKey}.${subRow.key}` : subRow.key}</td>
+                                                <td className="py-1.5 px-3">{subRow.value}</td>
+                                                <td className="py-1.5 px-3 text-center text-slate-500">{subRow.stableCount}</td>
+                                                <td className="py-1.5 px-3 text-center text-rose-600">-{subRow.leftCount}</td>
+                                                <td className="py-1.5 px-3 text-center text-emerald-600">+{subRow.arrivedCount}</td>
+                                                <td className="py-1.5 px-3 text-center">{subRow.netDelta > 0 ? `+${subRow.netDelta}` : subRow.netDelta}</td>
+                                              </tr>
+                                            ))}
+                                          </tbody>
+                                        </table>
+                                      </div>
+                                    </div>
+                                  )}
+
+                                  <div>
+                                    <div className="text-xs font-semibold text-slate-600 mb-2">
+                                      Заявки из базы, подходящие под статус {row.value}:
+                                    </div>
+                                    {filteredApps.length > 0 ? (
+                                      <div className="flex flex-wrap gap-2">
+                                        {filteredApps.slice(0, 10).map((app) => (
+                                          <button
+                                            key={app.id}
+                                            onClick={() => handleOpenDossier(app.id)}
+                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-blue-600 text-white text-xs font-mono font-semibold transition cursor-pointer shadow-xs"
+                                          >
+                                            <span>📄 {app.id}</span>
+                                            <span className="text-[10px] bg-white/20 px-1 py-0.5 rounded font-sans font-normal">
+                                              {app.afterDecision}
+                                            </span>
+                                          </button>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <div className="text-xs text-slate-500 bg-slate-50 p-3 rounded-lg border border-slate-200">
+                                        В текущей выборке нет заявок со статусом {row.value}.
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* 4. БЛОКИ ПАРАМЕТРОВ МОДЕЛИ */}
+            <div className="space-y-4">
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap justify-between items-center gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    placeholder="Поиск по модулю, атрибуту или значению..."
+                    value={currentWorkspace.searchFilter}
+                    onChange={(e) => updateCurrentWorkspace({ searchFilter: e.target.value })}
+                    className="bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-1.5 text-xs outline-none focus:border-blue-500 w-72"
+                  />
+                  <button
+                    onClick={() => updateCurrentWorkspace({ onlyDiffRows: !currentWorkspace.onlyDiffRows })}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                      currentWorkspace.onlyDiffRows
+                        ? 'bg-amber-500 text-white border-amber-500'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    {currentWorkspace.onlyDiffRows ? '● Только расхождения (DIFF=1)' : '○ Все бакеты'}
+                  </button>
+                  <button
+                    onClick={() => updateCurrentWorkspace({ sortByImpact: !currentWorkspace.sortByImpact })}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
+                      currentWorkspace.sortByImpact
+                        ? 'bg-slate-800 text-white border-slate-800'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                    }`}
+                  >
+                    {currentWorkspace.sortByImpact ? '↓ Сортировка по клиентам' : 'По порядку витрины'}
+                  </button>
+                </div>
+
+                <div className="text-xs text-slate-500">
+                  Модулей витрины: <b>{groupedParameterBlocks.length}</b>
+                </div>
+              </div>
+
+              {displayedBlocks.map((block) => {
+                const isCollapsed = !!collapsedClasses[block.className];
+                return (
+                  <div key={block.className} className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+                    <div
+                      onClick={() => toggleClassCollapse(block.className)}
+                      className="px-5 py-3 bg-slate-50/80 hover:bg-slate-100/80 border-b border-slate-200 flex flex-wrap justify-between items-center gap-2 cursor-pointer transition"
+                    >
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs font-bold text-slate-400">{isCollapsed ? '▶' : '▼'}</span>
+                        <span className="font-bold text-sm text-slate-800">{block.className}</span>
+                        <span className="text-xs text-slate-500">({block.rows.length} бакетов)</span>
+                      </div>
+
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-medium text-slate-600 bg-white border border-slate-200 px-2.5 py-0.5 rounded">
+                          Изменилось: <b>{block.affectedParams} из {block.totalParams}</b> параметров
+                        </span>
+                        <span className={`text-xs font-bold px-2.5 py-0.5 rounded ${
+                          block.maxAffectedClients > 0 ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
+                        }`}>
+                          Макс. сдвиг: до {block.maxAffectedClients} клиентов
+                        </span>
+                      </div>
+                    </div>
+
+                    {!isCollapsed && (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left text-xs">
+                          <thead className="bg-white text-slate-500 border-b border-slate-100">
+                            <tr>
+                              <th className="py-2 px-4 font-semibold">Параметр (KEY)</th>
+                              <th className="py-2 px-4 font-semibold">Бакет (VALUE)</th>
+                              <th className="py-2 px-4 font-semibold text-center">DIFF=0</th>
+                              <th className="py-2 px-4 font-semibold text-center text-rose-700">Ушло (BEFORE)</th>
+                              <th className="py-2 px-4 font-semibold text-center text-emerald-700">Пришло (AFTER)</th>
+                              <th className="py-2 px-4 font-semibold text-center">Дельта (Δ)</th>
+                              <th className="py-2 px-4 font-semibold">Вердикт аналитика</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100 font-mono">
+                            {block.rows.map((row) => {
+                              const hasDiff = row.totalChanges > 0;
+                              const ruleReview = (currentWorkspace.pivotReviews || {})[row.id];
+
+                              return (
+                                <tr key={row.id} className={hasDiff ? 'bg-amber-50/20 hover:bg-amber-50/50' : 'hover:bg-slate-50'}>
+                                  <td className="py-2 px-4 text-slate-700 font-medium">
+                                    {row.arrayKey ? `${row.arrayKey}${row.key ? '.' + row.key : ''}` : row.key || '—'}
+                                  </td>
+                                  <td className="py-2 px-4 font-bold text-slate-900">{row.value}</td>
+                                  <td className="py-2 px-4 text-center text-slate-500">{row.stableCount}</td>
+
+                                  <td className="py-2 px-4 text-center font-sans">
+                                    {row.leftCount > 0 ? (
+                                      <button
+                                        onClick={() => handleDrillDown(row, 'LEFT')}
+                                        className="px-2 py-0.5 rounded bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-700 border border-rose-200 font-mono font-bold transition cursor-pointer"
+                                      >
+                                        -{row.leftCount}
+                                      </button>
+                                    ) : (
+                                      <span className="text-slate-300">0</span>
+                                    )}
+                                  </td>
+
+                                  <td className="py-2 px-4 text-center font-sans">
+                                    {row.arrivedCount > 0 ? (
+                                      <button
+                                        onClick={() => handleDrillDown(row, 'ARRIVED')}
+                                        className="px-2 py-0.5 rounded bg-emerald-50 hover:bg-emerald-600 hover:text-white text-emerald-700 border border-emerald-200 font-mono font-bold transition cursor-pointer"
+                                      >
+                                        +{row.arrivedCount}
+                                      </button>
+                                    ) : (
+                                      <span className="text-slate-300">0</span>
+                                    )}
+                                  </td>
+
+                                  <td className="py-2 px-4 text-center font-sans font-bold">
+                                    {row.netDelta > 0 ? (
+                                      <span className="text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">+{row.netDelta}</span>
+                                    ) : row.netDelta < 0 ? (
+                                      <span className="text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">{row.netDelta}</span>
+                                    ) : (
+                                      <span className="text-slate-400">0</span>
+                                    )}
+                                  </td>
+
+                                  <td className="py-2 px-4 font-sans">
+                                    {hasDiff ? (
+                                      <div className="flex items-center gap-1">
+                                        {['OK', 'Вопрос', 'Баг'].map((status) => {
+                                          const isActive = ruleReview?.status === status;
+                                          return (
+                                            <button
+                                              key={status}
+                                              onClick={() => handleTogglePivotReview(row.id, status)}
+                                              className={`px-2 py-0.5 rounded text-[10px] font-bold border transition cursor-pointer ${
+                                                isActive
+                                                  ? 'bg-blue-600 text-white border-blue-600'
+                                                  : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                                              }`}
+                                            >
+                                              {status}
+                                            </button>
+                                          );
+                                        })}
+                                      </div>
+                                    ) : (
+                                      <span className="text-[10px] text-slate-400">Стабильно</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ── ВКЛАДКА: РЕЕСТР И ПОИСК ЗАЯВОК ── */}
         {activeTab === 'registry' && (
           <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs space-y-4 p-5">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-4">
-              <div className="space-y-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h2 className="text-base font-bold text-slate-800">Детальные примеры заявок</h2>
-                  {selectedPivotFilter && (
-                    <span className={`text-xs px-2.5 py-0.5 rounded-full font-semibold ${
-                      selectedPivotFilter.direction === 'LEFT'
-                        ? 'bg-rose-100 text-rose-800'
-                        : 'bg-emerald-100 text-emerald-800'
-                    }`}>
-                      {selectedPivotFilter.direction === 'LEFT' ? 'Ушло из' : 'Пришло в'}: {selectedPivotFilter.class} → {selectedPivotFilter.value} (в витрине: {selectedPivotFilter.expectedCount} шт., в локальном CSV: {filteredApps.length} шт.)
-                    </span>
-                  )}
-                </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-800">Реестр заявок из базы FastAPI (Отчёт #{reportId})</h2>
                 <p className="text-xs text-slate-500">
-                  Показывает конкретные заявки из подключённого файла сравнения (06_comparison_app1001.csv)
+                  Всего получено из API: <b>{registeredAppList.length}</b> заявок. Кликните на любую строку, чтобы загрузить поатрибутное досье.
                 </p>
               </div>
 
               {selectedPivotFilter && (
                 <button
                   onClick={() => setSelectedPivotFilter(null)}
-                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-300 transition"
+                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-300 transition cursor-pointer"
                 >
-                  ✕ Показать все примеры в CSV ({registeredAppList.length})
+                  ✕ Сбросить фильтр: {selectedPivotFilter.value}
                 </button>
               )}
             </div>
 
-            {filteredApps.length === 0 ? (
-              <div className="p-6 bg-slate-50 border border-slate-200 rounded-xl text-center space-y-3">
-                <div className="text-sm font-bold text-slate-800">
-                  Для потока «{selectedPivotFilter?.direction === 'LEFT' ? 'Ушло из' : 'Пришло в'} {selectedPivotFilter?.value}» ({selectedPivotFilter?.expectedCount} заявок в прогоне) в демо-файле CSV нет примера
-                </div>
-                <p className="text-xs text-slate-500 max-w-lg mx-auto">
-                  В демо-файле 06_comparison_app1001.csv приложена только заявка APP-1001 (её маршрут: ушла из APPROVE → пришла в VERIFICATION, лимит: ушла из (100K - 250K] → пришла в (0 - 100K]).
-                </p>
-                <button
-                  onClick={() => setSelectedPivotFilter(null)}
-                  className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-1.5 rounded-lg text-xs font-semibold transition"
-                >
-                  Сбросить фильтр и показать APP-1001
-                </button>
-              </div>
-            ) : (
-              <div className="overflow-x-auto border border-slate-200 rounded-xl">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
-                    <tr>
-                      <th className="py-2.5 px-3 font-semibold">ID заявки</th>
-                      <th className="py-2.5 px-3 font-semibold">Переход решения (MASTER → BETA)</th>
-                      <th className="py-2.5 px-3 font-semibold">Лимит (Сумма / Бакет)</th>
-                      <th className="py-2.5 px-3 font-semibold">Сработавший поток и драйвер</th>
-                      <th className="py-2.5 px-3 font-semibold">Статус заявки</th>
-                      <th className="py-2.5 px-3 font-semibold text-center">Досье</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 font-mono">
-                    {filteredApps.map((app) => {
-                      const appReview = (currentWorkspace.appReviews || {})[app.id];
-                      return (
-                        <tr
-                          key={app.id}
-                          onClick={() => setActiveDossierApp(app.id)}
-                          className="hover:bg-blue-50/40 cursor-pointer transition"
-                        >
-                          <td className="py-3 px-3 font-bold text-slate-900">{app.id}</td>
-                          <td className="py-3 px-3">
-                            <span className="text-rose-600 font-bold">{app.beforeDecision}</span>
-                            <span className="text-slate-400 mx-1.5">→</span>
-                            <span className="text-emerald-600 font-bold">{app.afterDecision}</span>
-                          </td>
-                          <td className="py-3 px-3 text-slate-700">
-                            <div>{app.limitBefore} → {app.limitAfter}</div>
-                            <div className="text-[10px] text-slate-400">{app.limitBucketBefore} → {app.limitBucketAfter}</div>
-                          </td>
-                          <td className="py-3 px-3 font-sans text-[11px]">
-                            {app.matchedContext ? (
-                              <div>
-                                <span className="bg-amber-100 text-amber-900 font-semibold px-1.5 py-0.5 rounded">
-                                  {app.matchedContext.directionLabel}: {app.matchedContext.before} → {app.matchedContext.after}
-                                </span>
-                                <div className="text-slate-500 mt-0.5">{app.driver}</div>
-                              </div>
-                            ) : (
-                              <span className="text-slate-600">{app.driver}</span>
-                            )}
-                          </td>
-                          <td className="py-3 px-3 font-sans" onClick={(e) => e.stopPropagation()}>
-                            <div className="flex gap-1">
-                              {['Разобрана', 'Эталон', 'Аномалия'].map((label) => {
-                                const isActive = appReview?.status === label;
-                                return (
-                                  <button
-                                    key={label}
-                                    onClick={() => handleToggleAppReview(app.id, label)}
-                                    className={`px-2 py-0.5 rounded text-[10px] font-bold border transition ${
-                                      isActive
-                                        ? 'bg-blue-600 text-white border-blue-600'
-                                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
-                                    }`}
-                                  >
-                                    {label}
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </td>
-                          <td className="py-3 px-3 text-center font-sans">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setActiveDossierApp(app.id);
-                              }}
-                              className="text-[11px] bg-slate-900 hover:bg-blue-600 text-white px-2.5 py-1 rounded font-semibold transition"
-                            >
-                              Поля ({app.rawRows.length}) →
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
+            <div className="flex flex-wrap items-center gap-2 bg-slate-50 p-4 rounded-xl border border-slate-200">
+              <span className="text-xs font-medium text-slate-700">APP_ID:</span>
+              <input
+                type="text"
+                placeholder="например: I32554354"
+                value={manualAppInput}
+                onChange={(e) => setManualAppInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && handleOpenDossier(manualAppInput)}
+                className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-mono outline-none focus:border-blue-500 w-64"
+              />
+              <button
+                onClick={() => handleOpenDossier(manualAppInput)}
+                disabled={isDossierLoading}
+                className="bg-slate-900 hover:bg-blue-600 text-white px-4 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer disabled:opacity-50"
+              >
+                {isDossierLoading ? 'Запрос...' : 'Открыть досье'}
+              </button>
+            </div>
+
+            <div className="overflow-x-auto border border-slate-200 rounded-xl">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+                  <tr>
+                    <th className="py-2.5 px-3 font-semibold">ID заявки</th>
+                    <th className="py-2.5 px-3 font-semibold">Решение в BETA (decision_after)</th>
+                    <th className="py-2.5 px-3 font-semibold">Расхождений (diff_count)</th>
+                    <th className="py-2.5 px-3 font-semibold">Статус</th>
+                    <th className="py-2.5 px-3 font-semibold text-center">Досье</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 font-mono">
+                  {filteredApps.map((app) => {
+                    const appReview = (currentWorkspace.appReviews || {})[app.id];
+                    const isUnknown = app.afterDecision === 'UNKNOWN';
+
+                    return (
+                      <tr
+                        key={app.id}
+                        onClick={() => handleOpenDossier(app.id)}
+                        className="hover:bg-blue-50/40 cursor-pointer transition"
+                      >
+                        <td className="py-3 px-3 font-bold text-slate-900">{app.id}</td>
+                        <td className="py-3 px-3">
+                          <span className={`font-bold px-2 py-0.5 rounded text-xs ${
+                            app.afterDecision === 'APPROVE' 
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : app.afterDecision === 'REJECT'
+                              ? 'bg-rose-100 text-rose-800'
+                              : isUnknown
+                              ? 'bg-amber-100 text-amber-800 font-normal'
+                              : 'bg-slate-100 text-slate-700'
+                          }`}>
+                            {app.afterDecision}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 text-slate-700">
+                          <span className="font-semibold text-amber-700">{app.diffCount}</span> шт.
+                        </td>
+                        <td className="py-3 px-3 font-sans" onClick={(e) => e.stopPropagation()}>
+                          <div className="flex gap-1">
+                            {['Разобрана', 'Аномалия'].map((label) => {
+                              const isActive = appReview?.status === label;
+                              return (
+                                <button
+                                  key={label}
+                                  onClick={() => handleToggleAppReview(app.id, label)}
+                                  className={`px-2 py-0.5 rounded text-[10px] font-bold border transition cursor-pointer ${
+                                    isActive
+                                      ? 'bg-blue-600 text-white border-blue-600'
+                                      : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {label}
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </td>
+                        <td className="py-3 px-3 text-center font-sans">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleOpenDossier(app.id);
+                            }}
+                            className="text-xs bg-slate-900 hover:bg-blue-600 text-white px-2.5 py-1 rounded font-semibold transition cursor-pointer"
+                          >
+                            Поля diff →
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
 
       </main>
 
-      {/* ── БОКОВАЯ ШТОРКА (ДОСЬЕ ЗАЯВКИ) ── */}
+      {/* ── БОКОВАЯ ШТОРКА (ПОАТРИБУТНЫЙ ДИФФ ЗАЯВКИ) ── */}
       {activeDossierApp && (
         <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-xs">
           <div className="bg-white w-full max-w-3xl h-full shadow-2xl flex flex-col p-6 overflow-hidden">
@@ -931,16 +1715,21 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <h3 className="font-bold text-lg text-slate-800">Досье заявки: {activeDossierApp}</h3>
                   <span className="text-xs bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded">
-                    Параметров: {(appsDatabase[activeDossierApp] || []).length}
+                    Параметров: {dossierRows.length}
                   </span>
+                  {isDossierLoading && (
+                    <span className="text-xs text-blue-600 animate-pulse font-semibold">
+                      Запрос к FastAPI...
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                  Поатрибутное сравнение сырых значений (VALUE) и бакетов (ADJUSTED)
+                  Сравнение параметров BEFORE (MASTER) и AFTER (BETA) из базы данных
                 </p>
               </div>
               <button
                 onClick={() => setActiveDossierApp(null)}
-                className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 rounded-lg hover:bg-slate-100"
+                className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 rounded-lg hover:bg-slate-100 cursor-pointer"
               >
                 ✕
               </button>
@@ -951,35 +1740,39 @@ export default function App() {
                 <table className="w-full text-left text-xs">
                   <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
                     <tr>
-                      <th className="py-2 px-3 font-semibold">CLASS</th>
-                      <th className="py-2 px-3 font-semibold">ARRAY_KEY / KEY</th>
-                      <th className="py-2 px-3 font-semibold text-rose-700">BEFORE (Сырое / Бакет)</th>
-                      <th className="py-2 px-3 font-semibold text-emerald-700">AFTER (Сырое / Бакет)</th>
+                      <th className="py-2 px-3 font-semibold">Модуль (PREFIX)</th>
+                      <th className="py-2 px-3 font-semibold">Параметр (KEY)</th>
+                      <th className="py-2 px-3 font-semibold text-rose-700">VALUE_BEFORE</th>
+                      <th className="py-2 px-3 font-semibold text-emerald-700">VALUE_AFTER</th>
                       <th className="py-2 px-3 font-semibold">Статус</th>
                       <th className="py-2 px-3 font-semibold">Комментарий</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 font-mono">
-                    {(appsDatabase[activeDossierApp] || []).map((row, idx) => {
-                      const isDiff = String(row.DIFF_FLAG) === '1';
-                      const keyPath = row.ARRAY_KEY
-                        ? `${row.ARRAY_KEY}${row.KEY ? '.' + row.KEY : ''}`
-                        : row.KEY || '(элемент массива)';
+                    {dossierRows.map((row, idx) => {
+                      const isDiff = Number(row.DIFF_FLAG ?? row.diff_flag) === 1;
+                      const mod = row.PREFIX || row.CLASS || '—';
+                      const key = row.ARRAY_KEY ? `${row.ARRAY_KEY}.${row.KEY}` : row.KEY || '(параметр)';
+                      const valBefore = row.VALUE_BEFORE ?? row.value_before ?? '—';
+                      const valAfter = row.VALUE_AFTER ?? row.value_after ?? '—';
+                      const adjBefore = row.ADJUSTED_BEFORE ?? row.adjusted_before ?? '';
+                      const adjAfter = row.ADJUSTED_AFTER ?? row.adjusted_after ?? '';
+                      const comment = row.COMMENT || row.comment || '—';
 
                       return (
                         <tr key={idx} className={isDiff ? 'bg-amber-50/50' : 'hover:bg-slate-50'}>
-                          <td className="py-2 px-3 font-sans text-slate-500">{row.CLASS}</td>
-                          <td className="py-2 px-3 font-bold text-slate-800">{keyPath}</td>
+                          <td className="py-2 px-3 font-sans text-slate-600">{mod}</td>
+                          <td className="py-2 px-3 font-bold text-slate-800">{key}</td>
                           <td className="py-2 px-3 text-rose-600">
-                            <div>{row.VALUE_BEFORE || '—'}</div>
-                            {row.ADJUSTED_BEFORE && row.ADJUSTED_BEFORE !== row.VALUE_BEFORE && (
-                              <div className="text-[10px] text-slate-400">бакет: {row.ADJUSTED_BEFORE}</div>
+                            <div>{valBefore}</div>
+                            {adjBefore && adjBefore !== valBefore && (
+                              <div className="text-[10px] text-slate-400">бакет: {adjBefore}</div>
                             )}
                           </td>
                           <td className="py-2 px-3 text-emerald-600 font-bold">
-                            <div>{row.VALUE_AFTER || '—'}</div>
-                            {row.ADJUSTED_AFTER && row.ADJUSTED_AFTER !== row.VALUE_AFTER && (
-                              <div className="text-[10px] text-slate-400 font-normal">бакет: {row.ADJUSTED_AFTER}</div>
+                            <div>{valAfter}</div>
+                            {adjAfter && adjAfter !== valAfter && (
+                              <div className="text-[10px] text-slate-400 font-normal">бакет: {adjAfter}</div>
                             )}
                           </td>
                           <td className="py-2 px-3">
@@ -989,7 +1782,7 @@ export default function App() {
                               {isDiff ? 'DIFF=1' : 'MATCH'}
                             </span>
                           </td>
-                          <td className="py-2 px-3 font-sans text-slate-600 text-[11px]">{row.COMMENT || '—'}</td>
+                          <td className="py-2 px-3 font-sans text-slate-600 text-[11px]">{comment}</td>
                         </tr>
                       );
                     })}
@@ -1001,7 +1794,7 @@ export default function App() {
             <div className="border-t border-slate-200 pt-3 flex justify-end">
               <button
                 onClick={() => setActiveDossierApp(null)}
-                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold transition"
+                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold transition cursor-pointer"
               >
                 Закрыть досье
               </button>
@@ -1010,38 +1803,122 @@ export default function App() {
         </div>
       )}
 
-      {/* Модалки создания правила и пользователя */}
-      {isRuleModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={handleAddRule} className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200">
-            <h3 className="font-bold text-sm text-slate-800">Новое правило для профиля: {currentUser}</h3>
-            <input
-              type="text"
-              required
-              placeholder="CLASS (например: antiFraudResult)"
-              value={newRuleClass}
-              onChange={(e) => setNewRuleClass(e.target.value)}
-              className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono"
-            />
-            <input
-              type="text"
-              placeholder="KEY (например: velocity_check)"
-              value={newRuleKey}
-              onChange={(e) => setNewRuleKey(e.target.value)}
-              className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono"
-            />
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setIsRuleModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600">Отмена</button>
-              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-lg">Добавить</button>
+      {/* ── МОДАЛЬНОЕ ОКНО РЕДАКТОРА PYTHON-КОДА (CODEMIRROR) ── */}
+      {codeEditorModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
+          <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl w-full max-w-3xl overflow-hidden flex flex-col text-white">
+            <div className="px-5 py-3.5 border-b border-slate-800 flex justify-between items-center">
+              <div>
+                <span className="text-[10px] font-mono uppercase tracking-wider text-blue-400 font-bold">Python Code Viewer</span>
+                <h3 className="font-bold text-sm text-slate-100">{codeEditorModal.title}</h3>
+              </div>
+              <button
+                onClick={() => setCodeEditorModal({ ...codeEditorModal, isOpen: false })}
+                className="text-slate-400 hover:text-white p-1 rounded-lg"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="p-3 bg-slate-950 font-mono text-xs">
+              <CodeMirror
+                value={codeEditorModal.code}
+                height="320px"
+                theme="dark"
+                extensions={[python()]}
+                readOnly={codeEditorModal.readOnly}
+                onChange={(val) => {
+                  if (!codeEditorModal.readOnly) {
+                    setCodeEditorModal((prev) => ({ ...prev, code: val }));
+                  }
+                }}
+              />
+            </div>
+
+            <div className="px-5 py-3 border-t border-slate-800 flex justify-between items-center bg-slate-900/80">
+              <span className="text-[11px] text-slate-400">
+                {codeEditorModal.readOnly ? 'Режим только для чтения' : 'Редактирование активно'}
+              </span>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setCodeEditorModal({ ...codeEditorModal, isOpen: false })}
+                  className="px-3 py-1.5 text-xs text-slate-300 hover:text-white transition cursor-pointer"
+                >
+                  Закрыть
+                </button>
+                {!codeEditorModal.readOnly && (
+                  <button
+                    onClick={() => {
+                      if (codeEditorModal.onSave) codeEditorModal.onSave(codeEditorModal.code);
+                      setCodeEditorModal({ ...codeEditorModal, isOpen: false });
+                    }}
+                    className="px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition cursor-pointer"
+                  >
+                    Сохранить изменения
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── МОДАЛЬНОЕ ОКНО СОЗДАНИЯ АВТОПРОВЕРКИ ── */}
+      {isCheckModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
+          <form onSubmit={handleAddCustomCheck} className="bg-white rounded-2xl p-6 w-full max-w-lg space-y-4 shadow-xl border border-slate-200">
+            <h3 className="font-bold text-sm text-slate-800">Новая автопроверка риск-политики</h3>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">Название правила</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="Контроль просрочек DTI"
+                  value={newCheckName}
+                  onChange={(e) => setNewCheckName(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-500 mb-1">Модуль (PREFIX)</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="decisionResult"
+                  value={newCheckClass}
+                  onChange={(e) => setNewCheckClass(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-[11px] text-slate-500 mb-1">Python-логика проверки (Live Code):</label>
+              <div className="rounded-lg overflow-hidden border border-slate-300 text-xs">
+                <CodeMirror
+                  value={newCheckCode}
+                  height="140px"
+                  theme="dark"
+                  extensions={[python()]}
+                  onChange={(val) => setNewCheckCode(val)}
+                />
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2">
+              <button type="button" onClick={() => setIsCheckModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer">Отмена</button>
+              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-lg cursor-pointer">Добавить проверку</button>
             </div>
           </form>
         </div>
       )}
 
+      {/* Модалка профиля аналитика */}
       {newUserModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <form onSubmit={handleCreateUser} className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200">
-            <h3 className="font-bold text-sm text-slate-800">Создать рабочее пространство аналитика</h3>
+            <h3 className="font-bold text-sm text-slate-800">Создать профиль аналитика</h3>
             <input
               type="text"
               required
@@ -1051,8 +1928,8 @@ export default function App() {
               className="w-full border border-slate-300 rounded-lg p-2 text-xs"
             />
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setNewUserModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600">Отмена</button>
-              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded-lg">Создать профиль</button>
+              <button type="button" onClick={() => setNewUserModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer">Отмена</button>
+              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded-lg cursor-pointer">Создать</button>
             </div>
           </form>
         </div>
