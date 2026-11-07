@@ -5,7 +5,7 @@ from datetime import datetime
 
 class RunCreate(BaseModel):
     user_id: int
-    config: Dict[str, Any] 
+    config: Dict[str, Any] = {}
 
 
 class RunResponse(BaseModel):

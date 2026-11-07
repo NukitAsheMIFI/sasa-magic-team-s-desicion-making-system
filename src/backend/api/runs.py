@@ -7,6 +7,8 @@ import datetime
 import time
 from services.runner import execute_python_script
 from pathlib import Path
+import os
+from sqlalchemy import func, literal
 
 router = APIRouter()
 
@@ -106,7 +108,7 @@ def run_pipeline(run_id: int, config: dict):
                 print("Данные успешно загружены в БД!")
                 
                 print("Генерация фактов для сводной таблицы...")
-                from sqlalchemy import func, literal
+                
                 
                 # 1. Считаем BEFORE
                 q_before = db.query(
@@ -149,38 +151,82 @@ def run_pipeline(run_id: int, config: dict):
                 db.commit()
                 print("Факты для сводной таблицы успешно сгенерированы!")
 
+                                # --- ЗАГРУЗКА СЕГМЕНТОВ ---
+                import os
+                print("Загрузка сегментов из segments.csv...")
+                
+                # Формируем путь к файлу (он лежит в той же папке temp/)
+                seg_file = res["out_file"].replace(".csv", "_segments.csv")
+                
+                if os.path.exists(seg_file):
+                    df_seg = pd.read_csv(seg_file, sep=';', encoding='utf-8-sig')
+                    seg_records = df_seg.to_dict('records')
+                    segments_to_insert = []
+                    
+                    for row in seg_records:
+                        segments_to_insert.append(models.Segment(
+                            run_id=run_id,
+                            app_id=str(row.get('APP_ID')),
+                            decision_before=str(row.get('DECISION_BEFORE')),
+                            decision_after=str(row.get('DECISION_AFTER')),
+                            decision_changed=int(row.get('DECISION_CHANGED', 0)),
+                            products=str(row.get('PRODUCTS')),
+                            pd_model_before=str(row.get('PD_MODEL_BEFORE')),
+                            pd_model_after=str(row.get('PD_MODEL_AFTER')),
+                            cutoff_before=str(row.get('CUTOFF_BEFORE')),
+                            cutoff_after=str(row.get('CUTOFF_AFTER'))
+                        ))
+                    
+                    db.bulk_save_objects(segments_to_insert)
+                    db.commit()
+                    print(f"Сегменты успешно загружены в БД! Строк: {len(segments_to_insert)}")
+                else:
+                    print("ВНИМАНИЕ: файл segments.csv не найден по пути", seg_file)
+                # ---------------------------
+
             elif step_name == "checks":
-                # ВРЕМЕННО ОТКЛЮЧЕНО, ПОКА АНАЛИТИК НЕ ДОДЕЛАЕТ СВОЙ КОД
-                print("Шаг проверок пропущен (временно отключен на бэкенде).")
-                # from services.checks_runner import run_all_checks
-                # print("Запуск автоматических проверок...")
-                # 
-                # current_file = Path(__file__).resolve()
-                # src_dir = current_file.parent.parent.parent
-                # checks_dir = src_dir / "checks" 
-                # 
-                # check_results = run_all_checks(db, run_id, str(checks_dir))
-                # 
-                # checks_to_insert = []
-                # for r in check_results:
-                #     checks_to_insert.append(models.CheckResult(
-                #         run_id=run_id,
-                #         label=r.get("LABEL", ""),
-                #         source=r.get("SOURCE", ""),
-                #         argument=r.get("ARGUMENT", ""),
-                #         cnt=r.get("CNT", 0),
-                #         total=r.get("TOTAL", 0),
-                #         metric=r.get("METRIC", 0.0),
-                #         result=r.get("RESULT", ""),
-                #         confidence=r.get("CONFIDENCE", ""),
-                #         app_ids=r.get("APP_IDS", [])
-                #     ))
-                # 
-                # db.bulk_save_objects(checks_to_insert)
-                # db.commit()
-                # print(f"Проверки завершены. Сохранено строк: {len(checks_to_insert)}")
+                import sys
+                import os
+                
+                # Подключаем папку analytics, чтобы импортировать оттуда модуль
+                current_file = Path(__file__).resolve()
+                src_dir = current_file.parent.parent.parent
+                analytics_dir = src_dir / "analytics"
+                if str(analytics_dir) not in sys.path:
+                    sys.path.append(str(analytics_dir))
+                
+                try:
+                    from checks_runner import run_all_checks
+                    print("Запуск автоматических проверок...")
+                    
+                    # ВНИМАНИЕ: У нового скрипта аналитика нет параметров db и checks_dir, только run_id!
+                    check_results = run_all_checks(run_id)
+                    
+                    # Сохраняем результаты в БД
+                    checks_to_insert = []
+                    for r in check_results:
+                        checks_to_insert.append(models.CheckResult(
+                            run_id=run_id,
+                            label=r.get("LABEL", ""),
+                            source=r.get("SOURCE", ""),
+                            argument=r.get("ARGUMENT", ""),
+                            cnt=r.get("CNT", 0),
+                            total=r.get("TOTAL", 0),
+                            metric=r.get("METRIC", 0.0),
+                            result=r.get("RESULT", ""),
+                            confidence=r.get("CONFIDENCE", ""),
+                            app_ids=r.get("APP_IDS", [])
+                        ))
+                    
+                    db.bulk_save_objects(checks_to_insert)
+                    db.commit()
+                    print(f"Проверки завершены. Сохранено строк: {len(checks_to_insert)}")
+                    
+                except Exception as e:
+                    print(f"Ошибка при выполнении проверок: {e}")
 
             step.status = "done"
+            step.logs = "Успешно выполнено"
             step.finished_at = datetime.datetime.now().isoformat()
             db.commit()
 
@@ -190,10 +236,24 @@ def run_pipeline(run_id: int, config: dict):
     except Exception as e:
         print(f"Pipeline error: {e}")
         db.rollback()
+        
+        # 1. Помечаем сам запуск как проваленный
         run = db.query(models.Run).filter(models.Run.id == run_id).first()
         if run:
             run.status = "failed"
             db.commit()
+            
+        # 2. Ищем шаг, который завис в статусе running, и помечаем его как failed
+        failed_step = db.query(models.RunStep).filter(
+            models.RunStep.run_id == run_id, 
+            models.RunStep.status == "running"
+        ).first()
+        
+        if failed_step:
+            failed_step.status = "failed"
+            failed_step.logs = str(e) # Записываем текст ошибки в логи шага
+            db.commit()
+
     finally:
         db.close()
 
@@ -225,12 +285,6 @@ def get_run_mart(run_id: int, db: Session = Depends(get_db)):
     """Эндпоинт для получения данных сводной таблицы (mock)"""
     rows = db.query(models.MartRow).filter(models.MartRow.run_id == run_id).all()
     return rows
-
-@router.get("/")
-def get_all_runs(db: Session = Depends(get_db)):
-    """Возвращает список всех запусков для экрана истории"""
-    runs = db.query(models.Run).order_by(models.Run.id.desc()).all()
-    return runs
 
 @router.get("/")
 def get_all_runs(db: Session = Depends(get_db)):
