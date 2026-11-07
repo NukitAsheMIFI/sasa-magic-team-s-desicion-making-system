@@ -2,11 +2,98 @@ import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
 
-import fallbackPivotFacts from './data/08_pivot_facts_demo.json';
-import fallbackComparisonCsv from './data/06_comparison_app1001.csv?raw';
+// Безопасный импорт локальных данных проекта (для работы в режиме оффлайн/демо)
+let fallbackPivotFacts = [];
+let fallbackComparisonCsv = '';
+try {
+  fallbackPivotFacts = (await import('./data/08_pivot_facts_demo.json')).default;
+  fallbackComparisonCsv = (await import('./data/06_comparison_app1001.csv?raw')).default;
+} catch (e) {
+  console.warn('Локальные файлы мок-данных не обнаружены, система работает напрямую с FastAPI.', e);
+}
 
+// ----------------------------------------------------
+// 1. ИСХОДНЫЙ КОД 5 ПРОВЕРОК ИЗ РЕПОЗИТОРИЯ (ДЛЯ ПРОСМОТРА)
+// ----------------------------------------------------
+const REPO_PYTHON_SCRIPTS = {
+  ar_drop_by_product: `# -*- coding: utf-8 -*-
+"""Approval Rate по продукту: FAIL, если относительное падение больше порога."""
+DEFAULTS = {"max_drop_rel": 0.10, "low_confidence_cnt": 5, "app_ids_limit": 20}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    by_product = {}
+    for s in mart.segments():
+        for product in (s.get("PRODUCTS") or "").split(";"):
+            if not product:
+                continue
+            d = by_product.setdefault(product, {"total": 0, "ap_b": 0, "ap_a": 0, "lost": []})
+            d["total"] += 1
+            if s.get("DECISION_BEFORE") == "APPROVE":
+                d["ap_b"] += 1
+            if s.get("DECISION_AFTER") == "APPROVE":
+                d["ap_a"] += 1
+            if s.get("DECISION_BEFORE") == "APPROVE" and s.get("DECISION_AFTER") != "APPROVE":
+                d["lost"].append(s["APP_ID"])
+    # Расчет drop_rel и возврат строк...
+`,
+  attribute_new_loss: `# -*- coding: utf-8 -*-
+"""Изменился состав атрибутов ответа: появились новые или пропали существующие."""
+DEFAULTS = {"min_share": 0.001, "low_confidence_cnt": 5, "app_ids_limit": 20}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    total = mart.total_apps()
+    agg = {}
+    for change in ("ATTRIBUTE_NEW", "ATTRIBUTE_LOST"):
+        for r in mart.rows(change_type=change):
+            agg.setdefault((change, r["PATH"]), set()).add(r["APP_ID"])
+`,
+  external_score_drift: `# -*- coding: utf-8 -*-
+"""Различие вызвано входными данными, а не стратегией."""
+SCORE_PATH = "characteristics.score_okb"
+FEATURE_PATH = "decisionResult.scoring.features.score_okb"
+DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    total = mart.total_apps()
+    drifted = {r["APP_ID"] for r in mart.rows(path=SCORE_PATH, diff_flag=1)}
+    decision_changed = {s["APP_ID"] for s in mart.segments() if s.get("DECISION_CHANGED")}
+    false_alarm = drifted & decision_changed
+`,
+  stop_factor_disappeared: `# -*- coding: utf-8 -*-
+"""Стоп-фактор перестал работать: правило пропало из ответа либо hit true -> false."""
+RULE_HIT_PATH = "decisionResult.product_trials.rules.hit"
+DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    lost, turned_off = {}, {}
+    for r in mart.rows(path=RULE_HIT_PATH, change_type="ATTRIBUTE_LOST"):
+        if r.get("VALUE_BEFORE") == "true":
+            lost.setdefault(r["ARRAY_KEY"], set()).add(r["APP_ID"])
+`,
+  target_model_changed: `# -*- coding: utf-8 -*-
+"""Сменилась целевая модель, по которой принимается решение по продукту."""
+DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    total = mart.total_apps()
+    pairs = {}
+    for s in mart.segments():
+        mb, ma = s.get("PD_MODEL_BEFORE"), s.get("PD_MODEL_AFTER")
+        if mb != ma:
+            pairs.setdefault(f"{mb} -> {ma}", set()).add(s["APP_ID"])
+`
+};
+
+// ----------------------------------------------------
+// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ----------------------------------------------------
 function parseSemicolonCsv(text) {
-  if (!text) return [];
+  if (!text || typeof text !== 'string') return [];
   const lines = text.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return [];
 
@@ -21,508 +108,236 @@ function parseSemicolonCsv(text) {
   });
 }
 
-const PIPELINE_STEP_CODES = {
-  load: `# Шаг 1: Загрузка и чтение исходных ответов СПР
-import os, json
-
-def load_credit_files(folder_path: str):
-    """Рекурсивное чтение файлов заявок BEFORE (MASTER) и AFTER (BETA)"""
-    files = [f for f in os.listdir(folder_path) if f.endswith('.json')]
-    print(f"Обнаружено файлов в выборке: {len(files)}")
-    return files
-`,
-  normalize: `# Шаг 2: Динамический обход JSON (Generic Flattener)
-def flatten_json(data, prefix='', path=''):
-    """Рекурсивный разбор структуры любой глубины без хардкода имен полей"""
-    items = []
-    if isinstance(data, dict):
-        for k, v in data.items():
-            new_path = f"{path}.{k}" if path else k
-            items.extend(flatten_json(v, prefix, new_path))
-    elif isinstance(data, list):
-        for idx, item in enumerate(data):
-            items.extend(flatten_json(item, prefix, f"{path}[{idx}]"))
-    else:
-        items.append({"key": path, "value": str(data)})
-    return items
-`,
-  union: `# Шаг 3: Вертикальный UNION и расчет расхождений (DuckDB)
-import duckdb
-
-def build_diff_storage(conn):
-    """Склейка срезов и классификация различий"""
-    conn.execute("""
-        CREATE TABLE mart_rows AS 
-        SELECT 
-            b.app_id, b.key,
-            b.value as value_before,
-            a.value as value_after,
-            CASE WHEN b.value != a.value THEN 1 ELSE 0 END as diff_flag
-        FROM raw_before b
-        FULL OUTER JOIN raw_after a ON b.app_id = a.app_id AND b.key = a.key
-    """)
-`,
-  checks: `# Шаг 4: Исполнение автопроверок риск-политики
-def check_approval_rate_drop(diff_df, max_drop=0.02):
-    """Контроль просадки уровня одобрения портфеля"""
-    before_rate = (diff_df['decision_before'] == 'APPROVE').mean()
-    after_rate = (diff_df['decision_after'] == 'APPROVE').mean()
-    delta = after_rate - before_rate
-    return {
-        "status": "PASS" if delta >= -max_drop else "FAIL",
-        "delta": round(delta * 100, 2)
-    }
-`
+const resolveModuleName = (row) => {
+  const raw = row.CLASS || row.class_name || row.PREFIX || row.prefix || 'Общие параметры';
+  return String(raw).trim() || 'Общие параметры';
 };
 
-const DEFAULT_WORKSPACES = {
-  'Аналитик 1 (Иван)': {
-    onlyDiffRows: false,
-    searchFilter: '',
-    sortByImpact: true,
-    customRules: [],
-    customChecks: [],
-    pivotReviews: {},
-    appReviews: {}
-  },
-  'Аналитик 2 (Мария)': {
-    onlyDiffRows: true,
-    searchFilter: '',
-    sortByImpact: true,
-    customRules: [],
-    customChecks: [],
-    pivotReviews: {},
-    appReviews: {}
-  }
-};
+const INITIAL_ANALYSTS = [
+  { id: '1', name: 'Аналитик 1 (Иван Семенов)', username: 'ivan', role: 'Lead Risk Modeler' },
+  { id: '2', name: 'Аналитик 2 (Мария Васильева)', username: 'maria', role: 'Senior Strategy Validator' }
+];
 
 export default function App() {
+  // ----------------------------------------------------
+  // СИСТЕМНОЕ СОСТОЯНИЕ
+  // ----------------------------------------------------
   const [activeTab, setActiveTab] = useState('matrix');
-  const [currentUser, setCurrentUser] = useState('Аналитик 1 (Иван)');
-  const [activeUserId, setActiveUserId] = useState(1);
-  const [userRuns, setUserRuns] = useState([]);
-
-  // Относительный путь по умолчанию: в Docker фронт и бэк на одном хосте
-  const [backendUrl, setBackendUrl] = useState(() => {
-    return localStorage.getItem('spr_backend_url') || '';
-  });
-  const [reportId, setReportId] = useState('2');
-  const [pivotFacts, setPivotFacts] = useState(fallbackPivotFacts);
-  const [apiAppsList, setApiAppsList] = useState([]);
+  const [apiStatus, setApiStatus] = useState('checking'); // 'connected' | 'fallback'
+  const [backendUrl, setBackendUrl] = useState(() => localStorage.getItem('spr_backend_url') || '');
+  const [runId, setRunId] = useState(null);
+  const [availableRuns, setAvailableRuns] = useState([]);
   const [isLoadingApi, setIsLoadingApi] = useState(false);
-  const [apiStatus, setApiStatus] = useState('init');
 
-  // Хелпер формирования URL (относительный или абсолютный)
-  const getApiUrl = useCallback((path) => {
-    const cleanBase = backendUrl ? backendUrl.trim().replace(/\/+$/, '') : '';
-    if (!cleanBase) return path;
-    return `${cleanBase}${path}`;
-  }, [backendUrl]);
-
-  // Состояния пайплайна
-  const [activeRunId, setActiveRunId] = useState(null);
-  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
-  const [pipelineSeconds, setPipelineSeconds] = useState(0);
-  const [pipelineSteps, setPipelineSteps] = useState([
-    { id: 'load', name: '1. Загрузка JSON-файлов датасета', status: 'done', time: '0.4s' },
-    { id: 'normalize', name: '2. Динамическая нормализация (Generic Flattener)', status: 'done', time: '1.8s' },
-    { id: 'union', name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'done', time: '0.9s' },
-    { id: 'checks', name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'done', time: '0.3s' }
-  ]);
-  const [runConfig, setRunConfig] = useState({
-    dataset: 'RUN-20260827-0001 (4004 файла BEFORE/AFTER)',
-    normalizer: 'normalizer_dynamic.py',
-    checks: ['approval_rate', 'stop_factors', 'scorecard_cutoff']
-  });
-  const pollingRef = useRef(null);
-  const timerRef = useRef(null);
-
-  // Редактор кода CodeMirror
-  const [codeEditorModal, setCodeEditorModal] = useState({
-    isOpen: false,
-    title: '',
-    code: '',
-    readOnly: true,
-    onSave: null
-  });
-
-  // Master-Detail и фильтрация
-  const [expandedSegmentClass, setExpandedSegmentClass] = useState(null);
-  const [selectedQualityGateId, setSelectedQualityGateId] = useState(null);
-  const [collapsedClasses, setCollapsedClasses] = useState({});
-  const [selectedPivotFilter, setSelectedPivotFilter] = useState(null);
-
-  // Боковое досье
-  const [activeDossierApp, setActiveDossierApp] = useState(null);
-  const [dossierRows, setDossierRows] = useState([]);
-  const [isDossierLoading, setIsDossierLoading] = useState(false);
-  const [manualAppInput, setManualAppInput] = useState('');
-
-  // Модальные окна
-  const [isCheckModalOpen, setIsCheckModalOpen] = useState(false);
-  const [newCheckName, setNewCheckName] = useState('Контроль обнуления лимита при APPROVE');
-  const [newCheckClass, setNewCheckClass] = useState('limitResult');
-  const [newCheckArg, setNewCheckArg] = useState('limit');
-  const [newCheckThreshold, setNewCheckThreshold] = useState('0 обнулений лимита');
-  const [newCheckCode, setNewCheckCode] = useState(`def check_zero_limits_on_approval(mart_df):
-    """
-    Quality Gate: запрещает скрытые отказы, когда заявке сохранили
-    статус APPROVE, но кредитный лимит схлопнулся до 0 рублей.
-    """
-    zero_limit_anomalies = mart_df.filter(
-        (mart_df["PREFIX"] == "limitResult") &
-        (mart_df["KEY"] == "limit") &
-        (mart_df["VALUE_AFTER"] == "0") &
-        (mart_df["DIFF_FLAG"] == 1)
-    )
-    violations = len(zero_limit_anomalies)
-    return {
-        "status": "PASS" if violations == 0 else "FAIL",
-        "violations_count": violations,
-        "threshold": "0 обнулений лимита"
-    }
-`);
-
-  const [newUserModalOpen, setNewUserModalOpen] = useState(false);
-  const [newUserName, setNewUserName] = useState('');
-
-  // Многопользовательское хранилище настроек интерфейса
-  const [workspaces, setWorkspaces] = useState(() => {
+  // Пользователи и аналитики
+  const [analysts, setAnalysts] = useState(() => {
     try {
-      const saved = localStorage.getItem('spr_diff_workspaces_v11');
-      return saved ? JSON.parse(saved) : DEFAULT_WORKSPACES;
+      const saved = localStorage.getItem('spr_analysts_list_v2');
+      return saved ? JSON.parse(saved) : INITIAL_ANALYSTS;
     } catch {
-      return DEFAULT_WORKSPACES;
+      return INITIAL_ANALYSTS;
     }
   });
+  const [currentUser, setCurrentUser] = useState(() => analysts[0] || INITIAL_ANALYSTS[0]);
+  const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserRole, setNewUserRole] = useState('Риск-аналитик');
+  const [newUserUsername, setNewUserUsername] = useState('');
 
+  // Сохранение списка аналитиков
   useEffect(() => {
     try {
-      localStorage.setItem('spr_diff_workspaces_v11', JSON.stringify(workspaces));
+      localStorage.setItem('spr_analysts_list_v2', JSON.stringify(analysts));
     } catch {}
-  }, [workspaces]);
+  }, [analysts]);
 
-  const currentWorkspace = workspaces[currentUser] || DEFAULT_WORKSPACES['Аналитик 1 (Иван)'];
+  // Данные из FastAPI
+  const [pivotFacts, setPivotFacts] = useState([]);
+  const [applications, setApplications] = useState([]);
+  const [checksResults, setChecksResults] = useState([]);
 
-  const updateCurrentWorkspace = (patch) => {
-    setWorkspaces((prev) => ({
-      ...prev,
-      [currentUser]: {
-        ...prev[currentUser],
-        ...patch
-      }
-    }));
-  };
+  // Пайплайн
+  const [pipelineSteps, setPipelineSteps] = useState([]);
+  const [isPipelineRunning, setIsPipelineRunning] = useState(false);
+  const [pipelineSeconds, setPipelineSeconds] = useState(0);
+  const timerRef = useRef(null);
 
-  // Авторизация пользователя через /api/auth/login и получение его реального id
-  const resolveUserId = useCallback(async (userLabel) => {
-    const isMaria = userLabel.includes('2') || userLabel.toLowerCase().includes('мария');
-    const username = isMaria ? 'maria' : 'ivan';
-    const fallbackId = isMaria ? 2 : 1;
+  // Фильтрация и Drill-down
+  const [selectedPivotFilter, setSelectedPivotFilter] = useState(null);
+  const [waterfallTargetBucket, setWaterfallTargetBucket] = useState(null); // Исход для диаграммы Waterfall
+  const [searchFilter, setSearchFilter] = useState('');
+  const [onlyDiffRows, setOnlyDiffRows] = useState(false);
+  const [significantOnly, setSignificantOnly] = useState(false);
+  const [sortMode, setSortMode] = useState('impact'); // 'impact' | 'delta' | 'alpha'
+  const [registryStatusFilter, setRegistryStatusFilter] = useState('ALL');
+  const [registrySearch, setRegistrySearch] = useState('');
+  const [collapsedModules, setCollapsedModules] = useState({});
 
+  // Досье заявки
+  const [activeDossierAppId, setActiveDossierAppId] = useState(null);
+  const [dossierRows, setDossierRows] = useState([]);
+  const [isDossierLoading, setIsDossierLoading] = useState(false);
+
+  // Модальные окна
+  const [codeModal, setCodeModal] = useState({ isOpen: false, title: '', code: '' });
+
+  const getApiUrl = useCallback((path) => {
+    const cleanBase = backendUrl.trim().replace(/\/+$/, '');
+    return cleanBase ? `${cleanBase}${path}` : path;
+  }, [backendUrl]);
+
+  // Авторизация аналитика
+  const authenticateAnalyst = useCallback(async (analyst) => {
+    setCurrentUser(analyst);
     try {
-      let res = await fetch(getApiUrl('/api/auth/login'), {
+      await fetch(getApiUrl('/api/auth/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password: 'password' })
+        body: JSON.stringify({ user_id: analyst.id, username: analyst.username })
       });
-
-      if (res.status === 422 || res.status === 415) {
-        const formData = new URLSearchParams();
-        formData.append('username', username);
-        formData.append('password', 'password');
-        res = await fetch(getApiUrl('/api/auth/login'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: formData
-        });
-      }
-
-      if (res.ok) {
-        const data = await res.json();
-        const detectedId = data.id || data.user_id || data.user?.id || fallbackId;
-        return Number(detectedId);
-      }
-    } catch (err) {
-      console.warn('Авторизация через /api/auth/login недоступна, используется id:', fallbackId, err);
-    }
-    return fallbackId;
+    } catch {}
   }, [getApiUrl]);
 
-  // Запрос истории запусков конкретного пользователя
-  const fetchUserRuns = useCallback(async (userId) => {
+  // ----------------------------------------------------
+  // ЗАГРУЗКА СПИСКА ПРОГОНОВ (БЕЗ ХАРДКОДА ID)
+  // ----------------------------------------------------
+  const fetchRunsList = useCallback(async () => {
     try {
-      const res = await fetch(getApiUrl(`/api/runs/?user_id=${userId}`), {
-        headers: { 'X-User-Id': String(userId) }
-      });
+      const res = await fetch(getApiUrl('/api/runs/'));
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data)) {
-          const userSpecific = data.filter((r) => !r.user_id || Number(r.user_id) === Number(userId));
-          setUserRuns(userSpecific.length > 0 ? userSpecific : data);
+        if (Array.isArray(data) && data.length > 0) {
+          setAvailableRuns(data);
+          setRunId((prev) => prev || String(data[data.length - 1].id || data[data.length - 1].run_id || 1));
+          setApiStatus('connected');
+          return;
         }
       }
-    } catch (e) {
-      console.warn('Ошибка загрузки истории прогонов пользователя:', e);
+    } catch {
+      console.warn('API /api/runs/ недоступен, включен режим фолбэка.');
     }
+    setApiStatus('fallback');
+    setRunId((prev) => prev || '1');
   }, [getApiUrl]);
 
-  // Смена текущего аналитика: авторизация + подтягивание его истории
-  const handleUserChange = async (newUserName) => {
-    setCurrentUser(newUserName);
-    const resolvedId = await resolveUserId(newUserName);
-    setActiveUserId(resolvedId);
-    await fetchUserRuns(resolvedId);
-  };
-
-  // Запрос агрегированной витрины и реестра с бэкенда
-  const fetchBackendData = useCallback(async (targetReportId) => {
+  // ----------------------------------------------------
+  // ЗАГРУЗКА ДАННЫХ ВЫБРАННОГО ПРОГОНА ИЗ FASTAPI
+  // ----------------------------------------------------
+  const fetchReportData = useCallback(async (targetRunId) => {
+    if (!targetRunId) return;
     setIsLoadingApi(true);
 
     try {
-      if (backendUrl) {
-        localStorage.setItem('spr_backend_url', backendUrl.trim());
-      } else {
-        localStorage.removeItem('spr_backend_url');
-      }
-
-      const resFacts = await fetch(getApiUrl(`/api/reports/${targetReportId}/pivot-facts`));
+      // 1. Загрузка витрины фактов
+      const resFacts = await fetch(getApiUrl(`/api/reports/${targetRunId}/pivot-facts`));
       if (resFacts.ok) {
-        const jsonFacts = await resFacts.json();
-        if (Array.isArray(jsonFacts)) setPivotFacts(jsonFacts);
+        const facts = await resFacts.json();
+        if (Array.isArray(facts)) setPivotFacts(facts);
+      } else if (fallbackPivotFacts?.length > 0) {
+        setPivotFacts(fallbackPivotFacts);
       }
 
-      const resApps = await fetch(getApiUrl(`/api/reports/${targetReportId}/applications`));
-      if (resApps.ok) {
-        const jsonApps = await resApps.json();
-        if (Array.isArray(jsonApps)) setApiAppsList(jsonApps);
-      } else {
-        setApiAppsList([]);
+      // 2. Загрузка готовых проверок из базы (CheckResult)
+      const resChecks = await fetch(getApiUrl(`/api/reports/${targetRunId}/checks`));
+      if (resChecks.ok) {
+        const checks = await resChecks.json();
+        if (Array.isArray(checks)) setChecksResults(checks);
       }
+
+      // 3. Загрузка реестра заявок
+      const resApps = await fetch(getApiUrl(`/api/reports/${targetRunId}/applications`));
+      if (resApps.ok) {
+        const apps = await resApps.json();
+        if (Array.isArray(apps)) setApplications(apps);
+      }
+
+      // 4. Загрузка этапов пайплайна
+      try {
+        const resSteps = await fetch(getApiUrl(`/api/runs/${targetRunId}/steps`));
+        if (resSteps.ok) {
+          const steps = await resSteps.json();
+          if (Array.isArray(steps)) setPipelineSteps(steps);
+        }
+      } catch {}
 
       setApiStatus('connected');
     } catch {
-      setPivotFacts(fallbackPivotFacts);
-      setApiAppsList([]);
       setApiStatus('fallback');
+      if (fallbackPivotFacts?.length > 0) setPivotFacts(fallbackPivotFacts);
     } finally {
       setIsLoadingApi(false);
     }
-  }, [backendUrl, getApiUrl]);
+  }, [getApiUrl]);
 
   useEffect(() => {
-    const initSession = async () => {
-      const uid = await resolveUserId(currentUser);
-      setActiveUserId(uid);
-      await fetchUserRuns(uid);
-      await fetchBackendData(reportId);
-    };
-    initSession();
-  }, [fetchBackendData, currentUser, resolveUserId, fetchUserRuns, reportId]);
+    fetchRunsList();
+  }, [fetchRunsList]);
 
-  // Запуск пайплайна: передача user_id и заголовка X-User-Id
-  const handleStartPipelineRun = async () => {
-    setIsPipelineRunning(true);
-    setPipelineSeconds(0);
+  useEffect(() => {
+    if (runId) {
+      fetchReportData(runId);
+    }
+  }, [runId, fetchReportData]);
 
-    setPipelineSteps([
-      { id: 'load', name: '1. Загрузка JSON-файлов датасета', status: 'running', time: '...' },
-      { id: 'normalize', name: '2. Динамическая нормализация (Generic Flattener)', status: 'pending', time: '—' },
-      { id: 'union', name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'pending', time: '—' },
-      { id: 'checks', name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'pending', time: '—' }
-    ]);
+  // ----------------------------------------------------
+  // ДОСЬЕ АНКЕТЫ (/api/reports/{run_id}/applications/{app_id}/diff)
+  // ----------------------------------------------------
+  const handleOpenDossier = useCallback(async (rawAppId) => {
+    if (!rawAppId) return;
+    const cleanId = String(rawAppId).trim();
+    const targetQueryId = cleanId.replace(/^APP-/, '');
 
-    if (timerRef.current) clearInterval(timerRef.current);
-    timerRef.current = setInterval(() => {
-      setPipelineSeconds((sec) => sec + 1);
-    }, 1000);
+    setActiveDossierAppId(cleanId);
+    setIsDossierLoading(true);
 
     try {
-      const res = await fetch(getApiUrl('/api/runs/'), {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-User-Id': String(activeUserId)
-        },
-        body: JSON.stringify({
-          user_id: Number(activeUserId),
-          config: runConfig
-        })
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const runData = await res.json();
-      const newRunId = runData.id || runData.run_id || 1;
-      setActiveRunId(newRunId);
-
-      if (pollingRef.current) clearInterval(pollingRef.current);
-      pollingRef.current = setInterval(async () => {
-        try {
-          const stepsRes = await fetch(getApiUrl(`/api/runs/${newRunId}/steps`));
-          if (stepsRes.ok) {
-            const stepsData = await stepsRes.json();
-            if (Array.isArray(stepsData) && stepsData.length > 0) {
-              setPipelineSteps(stepsData.map((s, idx) => ({
-                id: s.name || `step_${idx}`,
-                name: s.name ? `${idx + 1}. ${s.name}` : `Этап ${idx + 1}`,
-                status: s.status || (s.is_done ? 'done' : 'running'),
-                time: s.status === 'done' || s.is_done ? 'Готово' : 'В процессе...'
-              })));
-
-              const allDone = stepsData.every((s) => s.status === 'done' || s.is_done);
-              if (allDone) {
-                clearInterval(pollingRef.current);
-                clearInterval(timerRef.current);
-                setIsPipelineRunning(false);
-                setReportId(String(newRunId));
-
-                await fetchUserRuns(activeUserId);
-                await fetchBackendData(String(newRunId));
-                setActiveTab('matrix');
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('Ошибка опроса статуса шагов:', err);
+      const res = await fetch(getApiUrl(`/api/reports/${runId}/applications/${encodeURIComponent(targetQueryId)}/diff`));
+      if (res.ok) {
+        const rows = await res.json();
+        if (Array.isArray(rows) && rows.length > 0) {
+          setDossierRows(rows);
+          setIsDossierLoading(false);
+          return;
         }
-      }, 1000);
-
-    } catch {
-      setTimeout(() => {
-        setPipelineSteps((prev) => prev.map((s, idx) => ({ ...s, status: idx <= 1 ? 'done' : 'running' })));
-      }, 1200);
-
-      setTimeout(() => {
-        setPipelineSteps((prev) => prev.map((s) => ({ ...s, status: 'done', time: '0.8s' })));
-        clearInterval(timerRef.current);
-        setIsPipelineRunning(false);
-        setActiveTab('matrix');
-      }, 2600);
-    }
-  };
-
-  useEffect(() => {
-    return () => {
-      if (pollingRef.current) clearInterval(pollingRef.current);
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, []);
-
-  // Парсинг локального CSV
-  const parsedComparisonRows = useMemo(() => parseSemicolonCsv(fallbackComparisonCsv), []);
-
-  const appsDatabase = useMemo(() => {
-    const map = {};
-    parsedComparisonRows.forEach((row) => {
-      const rawId = row.APP_ID || '1001';
-      const appId = String(rawId);
-      if (!map[appId]) map[appId] = [];
-      map[appId].push(row);
-    });
-    return map;
-  }, [parsedComparisonRows]);
-
-  const registeredAppList = useMemo(() => {
-    if (apiAppsList.length > 0) {
-      return apiAppsList.map((app) => {
-        const id = String(app.app_id || app.id || app.APP_ID);
-        const decAfter = app.decision_after || app.afterDecision || app.VALUE_AFTER || '—';
-        const diffCnt = app.diff_count ?? app.diffCount ?? 0;
-
-        return {
-          id,
-          rawRows: appsDatabase[id] || [],
-          beforeDecision: app.beforeDecision || '—',
-          afterDecision: decAfter,
-          diffCount: diffCnt,
-          driver: decAfter === 'UNKNOWN' 
-            ? 'Решение: UNKNOWN (путь уточняется)' 
-            : `Решение в BETA: ${decAfter}`
-        };
-      });
-    }
-
-    return Object.keys(appsDatabase).map((appId) => {
-      const rows = appsDatabase[appId];
-      const decRow = rows.find((r) => (r.KEY || '').toLowerCase().includes('decision')) || rows[0];
-      const diffRows = rows.filter((r) => Number(r.DIFF_FLAG) === 1);
-
-      return {
-        id: appId,
-        rawRows: rows,
-        beforeDecision: decRow?.VALUE_BEFORE || '—',
-        afterDecision: decRow?.VALUE_AFTER || '—',
-        diffCount: diffRows.length,
-        driver: diffRows.map((r) => r.COMMENT).filter(Boolean).join('; ') || 'Без комментариев'
-      };
-    });
-  }, [apiAppsList, appsDatabase]);
-
-  const handleOpenDossier = useCallback(async (appId) => {
-    if (!appId) return;
-    const cleanId = String(appId).trim();
-    setActiveDossierApp(cleanId);
-
-    const targetQueryId = cleanId.replace(/^APP-/, '');
-    const localRows = appsDatabase[cleanId] || appsDatabase[targetQueryId] || [];
-    setDossierRows(localRows);
-
-    if (apiStatus === 'connected') {
-      setIsDossierLoading(true);
-      try {
-        const res = await fetch(getApiUrl(`/api/reports/${reportId}/applications/${encodeURIComponent(targetQueryId)}/diff`));
-        if (res.ok) {
-          const json = await res.json();
-          if (Array.isArray(json) && json.length > 0) {
-            setDossierRows(json);
-          }
-        }
-      } catch {
-      } finally {
-        setIsDossierLoading(false);
       }
+    } catch {}
+
+    // Локальный фолбэк по CSV
+    if (fallbackComparisonCsv) {
+      const parsed = parseSemicolonCsv(fallbackComparisonCsv);
+      const matched = parsed.filter(
+        (r) => r.APP_ID === cleanId || r.APP_ID === targetQueryId || String(r.APP_ID).replace(/^APP-/, '') === targetQueryId
+      );
+      setDossierRows(matched);
+    } else {
+      setDossierRows([]);
     }
-  }, [apiStatus, reportId, appsDatabase, getApiUrl]);
+    setIsDossierLoading(false);
+  }, [runId, getApiUrl]);
 
-  // Агрегация витрины facts
-  const combinedPivotFacts = useMemo(() => {
-    return [...pivotFacts, ...(currentWorkspace.customRules || [])];
-  }, [pivotFacts, currentWorkspace.customRules]);
-
-  const {
-    decisionSummaryRows,
-    groupedParameterBlocks,
-    summaryMetrics,
-    transitionMatrix,
-    qualityGates
-  } = useMemo(() => {
+  // ----------------------------------------------------
+  // ДИНАМИЧЕСКАЯ АГРЕГАЦИЯ ВИТРИНЫ
+  // ----------------------------------------------------
+  const { decisionRows, moduleBlocks, summaryMetrics, uniqueDecisions } = useMemo(() => {
     const map = {};
 
-    combinedPivotFacts.forEach((row) => {
-      let cls = 'Общие параметры';
-      if (row.CLASS && String(row.CLASS).trim() !== '') {
-        cls = String(row.CLASS).trim();
-      } else if (row.PREFIX && String(row.PREFIX).trim() !== '' && String(row.PREFIX).trim() !== 'company') {
-        cls = String(row.PREFIX).trim();
-      } else if (row.PREFIX) {
-        cls = String(row.PREFIX).trim();
-      }
-
+    pivotFacts.forEach((row) => {
+      const mod = resolveModuleName(row);
       const arrKey = row.ARRAY_KEY ? String(row.ARRAY_KEY) : '';
       const key = row.KEY ? String(row.KEY) : '';
       const val = row.VALUE_ADJUSTED ?? row.VALUE_AFTER ?? row.VALUE_BEFORE ?? '—';
-      const rowId = `${cls}__${arrKey}__${key}__${val}`;
+      const rowId = `${mod}__${arrKey}__${key}__${val}`;
 
       if (!map[rowId]) {
         map[rowId] = {
           id: rowId,
-          class: cls,
+          module: mod,
           arrayKey: arrKey,
           key,
           value: val,
           stableCount: 0,
           leftCount: 0,
-          arrivedCount: 0,
+          arrivedCount: 0
         };
       }
 
@@ -533,1282 +348,647 @@ export default function App() {
       if (!isDiff) {
         if (isBefore) map[rowId].stableCount += count;
       } else {
-        if (isBefore) {
-          map[rowId].leftCount += count;
-        } else {
-          map[rowId].arrivedCount += count;
-        }
+        if (isBefore) map[rowId].leftCount += count;
+        else map[rowId].arrivedCount += count;
       }
     });
 
-    const allRows = Object.values(map).map((r) => {
-      const totalBefore = r.stableCount + r.leftCount;
-      const totalAfter = r.stableCount + r.arrivedCount;
-      const netDelta = totalAfter - totalBefore;
-      const totalChanges = r.leftCount + r.arrivedCount;
-      const affectedClientsInBucket = Math.max(r.leftCount, r.arrivedCount);
+    const calculatedRows = Object.values(map).map((r) => {
+      const masterTotal = r.stableCount + r.leftCount;
+      const betaTotal = r.stableCount + r.arrivedCount;
+      const netDelta = betaTotal - masterTotal;
       return {
         ...r,
-        totalBefore,
-        totalAfter,
+        masterTotal,
+        betaTotal,
         netDelta,
         absDelta: Math.abs(netDelta),
-        totalChanges,
-        affectedClientsInBucket
+        totalChanges: r.leftCount + r.arrivedCount,
+        maxAffectedClients: Math.max(r.leftCount, r.arrivedCount)
       };
     });
 
-    const decRows = allRows.filter((r) => (r.key || '').toLowerCase().includes('decision') || (r.class || '').toLowerCase().includes('decision'));
-    const primaryClass = decRows.length > 0 ? decRows[0].class : (allRows[0]?.class || 'decisionResult');
-    const primaryDecRows = allRows.filter((r) => r.class === primaryClass);
+    // Определение модуля решений
+    const decRows = calculatedRows.filter(
+      (r) =>
+        r.key.toLowerCase().includes('decision') ||
+        r.module.toLowerCase().includes('decision') ||
+        r.module.toLowerCase() === 'decisionresult'
+    );
+    const primaryDecModule = decRows[0]?.module || calculatedRows[0]?.module || 'decisionResult';
+    const primaryDecRows = calculatedRows.filter((r) => r.module === primaryDecModule);
 
-    const totalPortfolio = primaryDecRows.reduce((acc, r) => acc + r.totalBefore, 0);
-    const stableApps = primaryDecRows.reduce((acc, r) => acc + r.stableCount, 0);
-    const flippedApps = primaryDecRows.reduce((acc, r) => acc + r.leftCount, 0);
+    // Уникальные исходы
+    const decValuesSet = new Set();
+    primaryDecRows.forEach((r) => decValuesSet.add(r.value));
+    applications.forEach((a) => {
+      if (a.afterDecision && a.afterDecision !== 'UNKNOWN') decValuesSet.add(a.afterDecision);
+      if (a.decision_after && a.decision_after !== 'UNKNOWN') decValuesSet.add(a.decision_after);
+    });
 
-    const approveRow = primaryDecRows.find((r) => String(r.value).toUpperCase() === 'APPROVE') || {
-      totalBefore: 0,
-      totalAfter: 0,
-      stableCount: 0,
-      leftCount: 0,
-      arrivedCount: 0
-    };
-    const rejectRow = primaryDecRows.find((r) => String(r.value).toUpperCase() === 'REJECT') || {
-      totalBefore: 0,
-      totalAfter: 0,
-      stableCount: 0,
-      leftCount: 0,
-      arrivedCount: 0
-    };
+    const totalPortfolio = primaryDecRows.reduce((sum, r) => sum + r.masterTotal, 0) || applications.length || 1;
+    const totalFlips = primaryDecRows.reduce((sum, r) => sum + r.leftCount, 0);
 
-    const rateBefore = totalPortfolio > 0 ? ((approveRow.totalBefore / totalPortfolio) * 100).toFixed(1) : '0.0';
-    const rateAfter = totalPortfolio > 0 ? ((approveRow.totalAfter / totalPortfolio) * 100).toFixed(1) : '0.0';
-    const rateDiffNum = Number((Number(rateAfter) - Number(rateBefore)).toFixed(1));
-
-    const decisionTable = (decRows.length > 0 ? decRows : primaryDecRows).map((r) => ({
-      ...r,
-      shareBefore: totalPortfolio > 0 ? ((r.totalBefore / totalPortfolio) * 100).toFixed(1) : '0.0',
-      shareAfter: totalPortfolio > 0 ? ((r.totalAfter / totalPortfolio) * 100).toFixed(1) : '0.0',
-      shareDiff: totalPortfolio > 0 ? (((r.totalAfter - r.totalBefore) / totalPortfolio) * 100).toFixed(1) : '0.0'
-    }));
-
-    const allUniqueParams = new Set();
-    const affectedUniqueParams = new Set();
-    const groupsMap = {};
-
-    allRows.forEach((row) => {
-      const paramKey = `${row.class}.${row.arrayKey}.${row.key}`;
-      allUniqueParams.add(paramKey);
-      if (row.totalChanges > 0) {
-        affectedUniqueParams.add(paramKey);
-      }
-
-      if (!groupsMap[row.class]) {
-        groupsMap[row.class] = {
-          className: row.class,
-          paramSet: new Set(),
-          affectedParamSet: new Set(),
-          maxAffectedClients: 0,
-          rowsCount: 0,
+    // Группировка блоков
+    const groups = {};
+    calculatedRows.forEach((r) => {
+      if (!groups[r.module]) {
+        groups[r.module] = {
+          name: r.module,
+          rows: [],
           totalDiffChanges: 0,
-          rows: []
+          maxAffectedClients: 0,
+          maxAbsDelta: 0
         };
       }
-      const grp = groupsMap[row.class];
-      grp.rows.push(row);
-      grp.rowsCount += 1;
-      grp.totalDiffChanges += row.totalChanges;
-      grp.paramSet.add(paramKey);
-      if (row.totalChanges > 0) {
-        grp.affectedParamSet.add(paramKey);
+      groups[r.module].rows.push(r);
+      groups[r.module].totalDiffChanges += r.totalChanges;
+      if (r.maxAffectedClients > groups[r.module].maxAffectedClients) {
+        groups[r.module].maxAffectedClients = r.maxAffectedClients;
       }
-      if (row.affectedClientsInBucket > grp.maxAffectedClients) {
-        grp.maxAffectedClients = row.affectedClientsInBucket;
+      if (r.absDelta > groups[r.module].maxAbsDelta) {
+        groups[r.module].maxAbsDelta = r.absDelta;
       }
-    });
-
-    const groupedBlocks = Object.values(groupsMap).map((g) => ({
-      className: g.className,
-      totalParams: g.paramSet.size,
-      affectedParams: g.affectedParamSet.size,
-      maxAffectedClients: g.maxAffectedClients,
-      totalDiffChanges: g.totalDiffChanges,
-      rowsCount: g.rowsCount,
-      rows: g.rows
-    }));
-
-    const dynamicGates = groupedBlocks.slice(0, 4).map((block, idx) => {
-      const changedRows = block.rows.filter((r) => r.totalChanges > 0);
-      const topShift = changedRows.reduce((max, r) => Math.max(max, r.affectedClientsInBucket), 0);
-      const isDecision = block.className === primaryClass;
-
-      let ruleName = `Контроль модуля «${block.className}»`;
-      let threshold = 'Δ ≤ 5% сдвига';
-      let status = 'PASS';
-      let metric = `${changedRows.length} изменившихся бакетов`;
-
-      if (isDecision) {
-        ruleName = 'Контроль стабильности уровня одобрения (Approval Rate)';
-        threshold = 'Δ AR ≥ -2.0%';
-        metric = `${rateBefore}% → ${rateAfter}% (${rateDiffNum > 0 ? '+' : ''}${rateDiffNum}%)`;
-        status = rateDiffNum >= -2.0 ? 'PASS' : 'FAIL';
-      } else {
-        status = block.totalDiffChanges === 0 || topShift < 30 ? 'PASS' : 'FAIL';
-        metric = changedRows.length > 0 ? `Макс. переток: ${topShift} анкет` : '0 расхождений (норма)';
-      }
-
-      return {
-        id: `gate-auto-${idx}`,
-        name: `${idx + 1}. ${ruleName}`,
-        targetClass: block.className,
-        argument: changedRows[0]?.key || block.className,
-        threshold,
-        metric,
-        affectedCount: topShift,
-        status,
-        codeSnippet: `def check_${block.className.toLowerCase()}(mart_df):\n    # Проверка отклонения по модулю ${block.className}\n    diff_rows = mart_df.filter(class_name="${block.className}", diff_flag=1)\n    return {"status": "${status}", "count": ${topShift}}\n`
-      };
-    });
-
-    const customGatesEvaluated = (currentWorkspace.customChecks || []).map((cg) => {
-      const matching = groupedBlocks.find((b) => b.className.toLowerCase() === (cg.targetClass || '').toLowerCase().trim());
-      const changedRows = matching ? matching.rows.filter((r) => r.totalChanges > 0) : [];
-      const diffs = changedRows.reduce((sum, r) => sum + r.affectedClientsInBucket, 0);
-
-      const hasFail = diffs > 0;
-      return {
-        ...cg,
-        status: hasFail ? 'FAIL' : 'PASS',
-        metric: matching 
-          ? (hasFail ? `Нарушений: ${diffs} анкет` : '0 расхождений (норма)')
-          : 'Модуль не найден в отчёте',
-        affectedCount: diffs
-      };
     });
 
     return {
-      decisionSummaryRows: decisionTable,
-      groupedParameterBlocks: groupedBlocks,
-      qualityGates: [...dynamicGates, ...customGatesEvaluated],
-      transitionMatrix: {
-        approveStable: approveRow.stableCount,
-        approveLost: approveRow.leftCount,
-        approveGained: approveRow.arrivedCount,
-        rejectStable: rejectRow.stableCount,
-        rejectLost: rejectRow.leftCount,
-        rejectGained: rejectRow.arrivedCount
-      },
+      decisionRows: primaryDecRows,
+      moduleBlocks: Object.values(groups),
+      uniqueDecisions: Array.from(decValuesSet),
       summaryMetrics: {
-        primaryClass,
         totalPortfolio,
-        stableApps,
-        flippedApps,
-        rateBefore,
-        rateAfter,
-        rateDiff: rateDiffNum > 0 ? `+${rateDiffNum}%` : `${rateDiffNum}%`,
-        totalRows: allRows.length,
-        totalUniqueParams: allUniqueParams.size,
-        affectedUniqueParams: affectedUniqueParams.size
+        totalFlips,
+        flipsPct: ((totalFlips / totalPortfolio) * 100).toFixed(1)
       }
     };
-  }, [combinedPivotFacts, currentWorkspace.customChecks]);
+  }, [pivotFacts, applications]);
 
-  // Фильтрация блоков параметров
-  const displayedBlocks = useMemo(() => {
-    const q = (currentWorkspace.searchFilter || '').toLowerCase();
+  // Строка, выбранная для отображения в Waterfall
+  const activeWaterfallRow = useMemo(() => {
+    if (decisionRows.length === 0) return null;
+    if (waterfallTargetBucket) {
+      return decisionRows.find((r) => r.value === waterfallTargetBucket) || decisionRows[0];
+    }
+    return decisionRows[0];
+  }, [decisionRows, waterfallTargetBucket]);
 
-    return groupedParameterBlocks
+  // ----------------------------------------------------
+  // ФИЛЬТРАЦИЯ БЛОКОВ ВИТРИНЫ
+  // ----------------------------------------------------
+  const filteredBlocks = useMemo(() => {
+    const q = searchFilter.toLowerCase().trim();
+
+    let list = moduleBlocks
       .map((block) => {
-        let filteredRows = block.rows.filter((row) => {
-          if (currentWorkspace.onlyDiffRows && row.totalChanges === 0) return false;
+        let rows = block.rows.filter((r) => {
+          if (onlyDiffRows && r.totalChanges === 0) return false;
+          if (significantOnly && r.maxAffectedClients < 10) return false;
           if (q) {
             const match =
-              row.class.toLowerCase().includes(q) ||
-              row.arrayKey.toLowerCase().includes(q) ||
-              row.key.toLowerCase().includes(q) ||
-              String(row.value).toLowerCase().includes(q);
+              r.module.toLowerCase().includes(q) ||
+              r.key.toLowerCase().includes(q) ||
+              String(r.value).toLowerCase().includes(q);
             if (!match) return false;
           }
           return true;
         });
 
-        if (currentWorkspace.sortByImpact) {
-          filteredRows = [...filteredRows].sort(
-            (a, b) => b.affectedClientsInBucket - a.affectedClientsInBucket || b.absDelta - a.absDelta
-          );
-        }
+        rows.sort((a, b) => {
+          if (sortMode === 'impact') return b.maxAffectedClients - a.maxAffectedClients || b.totalChanges - a.totalChanges;
+          if (sortMode === 'delta') return b.absDelta - a.absDelta;
+          return a.key.localeCompare(b.key);
+        });
 
-        return { ...block, rows: filteredRows };
+        return { ...block, rows };
       })
-      .filter((block) => block.rows.length > 0);
-  }, [groupedParameterBlocks, currentWorkspace.onlyDiffRows, currentWorkspace.searchFilter, currentWorkspace.sortByImpact]);
+      .filter((b) => b.rows.length > 0);
 
-  // Фильтрация реестра заявок
+    list.sort((a, b) => {
+      if (sortMode === 'impact') return b.maxAffectedClients - a.maxAffectedClients;
+      if (sortMode === 'delta') return b.maxAbsDelta - a.maxAbsDelta;
+      return a.name.localeCompare(b.name);
+    });
+
+    return list;
+  }, [moduleBlocks, searchFilter, onlyDiffRows, significantOnly, sortMode]);
+
+  // ----------------------------------------------------
+  // ФИЛЬТРАЦИЯ РЕЕСТРА АНКЕТ
+  // ----------------------------------------------------
   const filteredApps = useMemo(() => {
-    return registeredAppList.filter((app) => {
-      if (!selectedPivotFilter) return true;
-      if (selectedPivotFilter.value && app.afterDecision === selectedPivotFilter.value) {
-        return true;
+    const q = registrySearch.toLowerCase().trim();
+
+    return applications.filter((app) => {
+      const appId = String(app.app_id || app.id || '');
+      const decAfter = app.afterDecision || app.decision_after || '—';
+
+      if (q && !appId.toLowerCase().includes(q)) return false;
+      if (registryStatusFilter !== 'ALL' && decAfter !== registryStatusFilter) return false;
+
+      if (selectedPivotFilter) {
+        const targetVal = String(selectedPivotFilter.value).toUpperCase();
+        if (selectedPivotFilter.direction === 'LEFT') {
+          return decAfter.toUpperCase() !== targetVal;
+        }
+        if (selectedPivotFilter.direction === 'ARRIVED') {
+          return decAfter.toUpperCase() === targetVal;
+        }
+        const diffCnt = Number(app.diffCount ?? app.diff_count ?? 0);
+        return diffCnt > 0;
       }
-      return false;
+      return true;
     });
-  }, [registeredAppList, selectedPivotFilter]);
+  }, [applications, registrySearch, registryStatusFilter, selectedPivotFilter]);
 
-  const handleDrillDown = (row, direction) => {
-    const expectedCount = direction === 'LEFT' ? row.leftCount : row.arrivedCount;
-    if (expectedCount === 0) return;
-
-    setSelectedPivotFilter({
-      class: row.class,
-      arrayKey: row.arrayKey,
-      key: row.key,
-      value: row.value,
-      direction,
-      expectedCount
-    });
-    setExpandedSegmentClass(`${row.class}__${row.value}`);
-  };
-
-  const toggleClassCollapse = (className) => {
-    setCollapsedClasses((prev) => ({ ...prev, [className]: !prev[className] }));
-  };
-
-  const openCodeModal = (title, code, readOnly = true, onSave = null) => {
-    setCodeEditorModal({
-      isOpen: true,
-      title,
-      code,
-      readOnly,
-      onSave
-    });
-  };
-
-  const handleAddCustomCheck = (e) => {
-    e.preventDefault();
-    if (!newCheckName.trim()) return;
-
-    const newGate = {
-      id: `custom-${Date.now()}`,
-      name: newCheckName.trim(),
-      targetClass: newCheckClass.trim() || 'limitResult',
-      argument: newCheckArg.trim() || 'limit',
-      threshold: newCheckThreshold.trim() || '0 обнулений лимита',
-      codeSnippet: newCheckCode,
-      isCustom: true
-    };
-
-    updateCurrentWorkspace({
-      customChecks: [...(currentWorkspace.customChecks || []), newGate]
-    });
-    setIsCheckModalOpen(false);
-  };
-
-  const handleDeleteCustomCheck = (checkId) => {
-    updateCurrentWorkspace({
-      customChecks: (currentWorkspace.customChecks || []).filter((c) => c.id !== checkId)
-    });
-    if (selectedQualityGateId === checkId) setSelectedQualityGateId(null);
-  };
-
-  const handleCreateUser = (e) => {
+  // Добавление нового аналитика
+  const handleCreateAnalyst = (e) => {
     e.preventDefault();
     if (!newUserName.trim()) return;
-    const label = newUserName.trim();
-    if (!workspaces[label]) {
-      setWorkspaces((prev) => ({
-        ...prev,
-        [label]: {
-          onlyDiffRows: false,
-          searchFilter: '',
-          sortByImpact: true,
-          customRules: [],
-          customChecks: [],
-          pivotReviews: {},
-          appReviews: {}
-        }
-      }));
-    }
-    handleUserChange(label);
+
+    const newAnalyst = {
+      id: String(Date.now()),
+      name: newUserName.trim(),
+      username: newUserUsername.trim() || newUserName.trim().toLowerCase().replace(/\s+/g, '_'),
+      role: newUserRole.trim() || 'Риск-аналитик'
+    };
+
+    setAnalysts((prev) => [...prev, newAnalyst]);
+    authenticateAnalyst(newAnalyst);
     setNewUserName('');
-    setNewUserModalOpen(false);
+    setNewUserUsername('');
+    setIsAddUserModalOpen(false);
+  };
+
+  // Экспорт автономного HTML
+  const handleExportHtml = () => {
+    const reportDate = new Date().toLocaleString('ru-RU');
+    const content = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>СПР • Аудит кредитного риска — Прогон #${runId}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; padding: 32px; }
+    .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
+    th { background: #f1f5f9; color: #475569; font-size: 11px; text-transform: uppercase; }
+    .badge-pass { background: #d1fae5; color: #065f46; font-weight: bold; padding: 2px 6px; border-radius: 4px; }
+    .badge-fail { background: #ffe4e6; color: #9f1239; font-weight: bold; padding: 2px 6px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h2>Отчёт аудита кредитных стратегий СПР (Прогон #${runId})</h2>
+  <p style="color:#64748b;font-size:12px;">Сформировано: ${reportDate} | Аналитик: ${currentUser.name} (${currentUser.role})</p>
+  
+  <div class="card">
+    <h3>Macro Impact (Сводка портфеля)</h3>
+    <p>Всего анкет в выборке: <b>${summaryMetrics.totalPortfolio}</b></p>
+    <p>Сменили решение (Flips): <b>${summaryMetrics.totalFlips} (${summaryMetrics.flipsPct}%)</b></p>
+  </div>
+
+  <div class="card">
+    <h3>Исполнение проверок качества (Quality Gates)</h3>
+    <table>
+      <thead><tr><th>Правило</th><th>Аргумент</th><th>Метрика</th><th>Факт</th><th>Статус</th></tr></thead>
+      <tbody>
+        ${checksResults.map((c) => `
+          <tr>
+            <td><b>${c.LABEL || c.label || '—'}</b></td>
+            <td><code>${c.ARGUMENT || c.argument || '—'}</code></td>
+            <td>${c.METRIC ?? c.metric ?? '—'}</td>
+            <td>${c.CNT ?? c.cnt ?? 0} из ${c.TOTAL ?? c.total ?? '—'}</td>
+            <td><span class="${(c.RESULT || c.result) === 'PASS' ? 'badge-pass' : 'badge-fail'}">${c.RESULT || c.result}</span></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>`;
+
+    const blob = new Blob(['\ufeff' + content], { type: 'text/html;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `SPR_Audit_Report_Run_${runId}.html`;
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="min-h-screen bg-slate-50/70 text-slate-900 font-sans flex flex-col">
-      
-      {/* ── ШАПКА ── */}
-      <header className="border-b border-slate-200 bg-white px-6 py-2.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30 shadow-xs">
-        <div className="flex flex-wrap items-center gap-4">
-          <div className="flex items-center gap-2">
-            <span className={`w-2.5 h-2.5 rounded-full ${apiStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}></span>
-            <span className="font-bold text-sm tracking-tight text-slate-800">СПР • Сравнение кредитных стратегий</span>
-          </div>
-
-          <nav className="flex gap-1 bg-slate-100 p-1 rounded-lg">
+    <div className="min-h-screen bg-slate-50/70 text-slate-900 font-sans flex flex-col antialiased">
+      {/* ==========================================
+          ШАПКА (СВЕТЛАЯ FINTECH ТЕМА)
+      ========================================== */}
+      <header className="border-b border-slate-200 bg-white px-6 py-2.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30 shadow-sm">
+        <div className="flex items-center gap-3">
+          <span className={`w-2.5 h-2.5 rounded-full ${apiStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+          <span className="font-bold text-sm text-slate-800">СПР • Аудит кредитных стратегий</span>
+          
+          {/* Селектор прогонов */}
+          <div className="flex items-center gap-1.5 bg-slate-100 border border-slate-200 rounded-lg px-2 py-0.5 text-xs font-mono">
+            <span className="text-slate-500 font-sans">Прогон:</span>
+            {availableRuns.length > 0 ? (
+              <select
+                value={runId || ''}
+                onChange={(e) => setRunId(e.target.value)}
+                className="bg-transparent border-none outline-none font-bold text-blue-700 cursor-pointer"
+              >
+                {availableRuns.map((r) => (
+                  <option key={r.id || r.run_id} value={r.id || r.run_id}>
+                    #{r.id || r.run_id} {r.status ? `(${r.status})` : ''}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                type="text"
+                value={runId || ''}
+                onChange={(e) => setRunId(e.target.value)}
+                className="w-10 bg-white border border-slate-300 rounded px-1 text-center font-bold text-blue-700"
+              />
+            )}
             <button
-              onClick={() => setActiveTab('run')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 ${
-                activeTab === 'run' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
+              onClick={() => runId && fetchReportData(runId)}
+              className="text-slate-600 hover:text-blue-600 font-bold px-1"
+              title="Обновить данные"
             >
-              <span>▶ Запуск и пайплайн</span>
-              {isPipelineRunning && <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping"></span>}
+              ↻
             </button>
-            <button
-              onClick={() => setActiveTab('matrix')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
-                activeTab === 'matrix' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Сводный отчёт ({summaryMetrics.totalRows})
-            </button>
-            <button
-              onClick={() => setActiveTab('registry')}
-              className={`px-3 py-1 rounded-md text-xs font-semibold transition cursor-pointer ${
-                activeTab === 'registry' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Реестр заявок ({registeredAppList.length} шт.)
-            </button>
-          </nav>
-
-          {/* Панель подключения к API: без хардкода localhost */}
-          <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-lg px-2 py-1 text-xs">
-            <span className="text-slate-400 font-medium">Хост API:</span>
-            <input
-              type="text"
-              value={backendUrl}
-              onChange={(e) => setBackendUrl(e.target.value)}
-              placeholder="относительный (/api)"
-              className="bg-white border border-slate-300 rounded px-2 py-0.5 text-xs font-mono w-32 outline-none focus:border-blue-500"
-              title="Оставьте пустым для относительных путей /api (Docker / Proxy) или введите хост"
-            />
-            <span className="text-slate-400">#</span>
-            <input
-              type="text"
-              value={reportId}
-              onChange={(e) => setReportId(e.target.value)}
-              className="bg-white border border-slate-300 rounded px-1.5 py-0.5 text-xs font-mono w-8 text-center outline-none focus:border-blue-500"
-              title="ID прогона отчёта"
-            />
-            <button
-              onClick={() => fetchBackendData(reportId)}
-              className="px-2 py-0.5 bg-slate-900 hover:bg-blue-600 text-white rounded font-semibold transition cursor-pointer"
-              title="Обновить данные с бэкенда"
-            >
-              {isLoadingApi ? '...' : '↻'}
-            </button>
-            <span className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-              apiStatus === 'connected' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'
-            }`}>
-              {apiStatus === 'connected' ? `RUN #${reportId} ONLINE` : 'DEMO'}
-            </span>
           </div>
         </div>
 
-        {/* Многопользовательский блок */}
-        <div className="flex items-center gap-2.5">
-          <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1 text-xs shadow-xs">
-            <span className="text-slate-400">👤</span>
-            <select
-              value={currentUser}
-              onChange={(e) => handleUserChange(e.target.value)}
-              className="bg-transparent border-none outline-none font-medium text-slate-700 cursor-pointer"
+        {/* Навигация */}
+        <nav className="flex gap-1 bg-slate-100 p-1 rounded-lg text-xs font-semibold">
+          {[
+            { id: 'matrix', label: 'Сводный отчёт (Витрина)' },
+            { id: 'registry', label: `Реестр заявок (${filteredApps.length})` },
+            { id: 'run', label: 'Запуск и пайплайн' }
+          ].map((t) => (
+            <button
+              key={t.id}
+              onClick={() => setActiveTab(t.id)}
+              className={`px-3 py-1.5 rounded-md transition cursor-pointer ${
+                activeTab === t.id ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              }`}
             >
-              {Object.keys(workspaces).map((u) => (
-                <option key={u} value={u}>{u}</option>
+              {t.label}
+            </button>
+          ))}
+        </nav>
+
+        {/* Селектор аналитика + Кнопка добавления + Экспорт */}
+        <div className="flex items-center gap-2 text-xs">
+          <div className="flex items-center bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-sm">
+            <span className="text-slate-400 mr-1.5">👤</span>
+            <select
+              value={currentUser.id}
+              onChange={(e) => {
+                const found = analysts.find((a) => a.id === e.target.value);
+                if (found) authenticateAnalyst(found);
+              }}
+              className="bg-transparent border-none outline-none font-semibold text-slate-700 cursor-pointer"
+            >
+              {analysts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}
+                </option>
               ))}
             </select>
-            <span className="text-[10px] bg-blue-100 text-blue-800 font-mono font-bold px-1.5 py-0.5 rounded">
-              id:{activeUserId}
-            </span>
           </div>
 
           <button
-            onClick={() => setNewUserModalOpen(true)}
-            className="px-2.5 py-1 rounded-lg text-xs font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
+            onClick={() => setIsAddUserModalOpen(true)}
+            className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
+            title="Создать новую учётную запись аналитика"
           >
             + Аналитик
           </button>
 
           <button
-            onClick={() => setIsCheckModalOpen(true)}
-            className="px-3 py-1 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-xs cursor-pointer"
+            onClick={handleExportHtml}
+            className="px-3 py-1 rounded-lg font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition shadow-sm cursor-pointer"
           >
-            + Автопроверка
+            ⬇ Скачать HTML
           </button>
         </div>
       </header>
 
-      {/* ── ОСНОВНОЙ КОНТЕНТ ── */}
-      <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-6">
-
-        {/* ── ВКЛАДКА: ЗАПУСК БЭКТЕСТА, ПАЙПЛАЙН И ИСТОРИЯ ── */}
-        {activeTab === 'run' && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-12 gap-6">
-              <div className="md:col-span-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
-                <div className="border-b border-slate-100 pb-3">
-                  <div className="flex justify-between items-center">
-                    <h2 className="text-base font-bold text-slate-800">Конфигурация бэктеста</h2>
-                    <span className="text-xs bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-mono font-bold">
-                      User ID: {activeUserId}
-                    </span>
-                  </div>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Запуск пайплайна нормализации через <code>POST /api/runs/</code>
-                  </p>
-                </div>
-
-                <div className="space-y-3 text-xs">
-                  <div>
-                    <label className="block font-medium text-slate-700 mb-1">Выбор пула ретро-заявок (Датасет)</label>
-                    <select 
-                      value={runConfig.dataset}
-                      onChange={(e) => setRunConfig({ ...runConfig, dataset: e.target.value })}
-                      className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-mono text-slate-800 outline-none focus:border-blue-500"
-                    >
-                      <option value="RUN-20260827-0001 (4004 файла BEFORE/AFTER)">RUN-20260827-0001 (4004 файла BEFORE/AFTER)</option>
-                      <option value="RUN-20260901-0042 (1000 файлов)">RUN-20260901-0042 (1000 файлов)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <div className="flex justify-between items-center mb-1">
-                      <label className="font-medium text-slate-700">Процедура нормализации (Скрипт)</label>
-                      <button
-                        onClick={() => openCodeModal('normalizer_dynamic.py', PIPELINE_STEP_CODES.normalize, false, (newCode) => {
-                          PIPELINE_STEP_CODES.normalize = newCode;
-                        })}
-                        className="text-blue-600 hover:underline font-semibold cursor-pointer"
-                      >
-                        Редактировать код →
-                      </button>
-                    </div>
-                    <input
-                      type="text"
-                      value={runConfig.normalizer}
-                      onChange={(e) => setRunConfig({ ...runConfig, normalizer: e.target.value })}
-                      className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-mono text-slate-800"
-                    />
-                  </div>
-
-                  <div className="pt-2">
-                    <button
-                      onClick={handleStartPipelineRun}
-                      disabled={isPipelineRunning}
-                      className="w-full py-2.5 px-4 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
-                    >
-                      {isPipelineRunning ? (
-                        <>
-                          <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                          <span>Идёт расчёт ({pipelineSeconds} сек)...</span>
-                        </>
-                      ) : (
-                        <span>▶ Запустить сравнение кредитных стратегий (ID: {activeUserId})</span>
-                      )}
-                    </button>
-                  </div>
-                </div>
+      {/* ==========================================
+          ВКЛАДКА 1: СВОДНЫЙ ОТЧЁТ И ВИТРИНА
+      ========================================== */}
+      {activeTab === 'matrix' && (
+        <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-6">
+          {/* 1. БЫСТРАЯ ОСНОВНАЯ ИНФОРМАЦИЯ (EXECUTIVE SUMMARY) */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Всего анкет в выборке</div>
+              <div className="text-2xl font-extrabold text-slate-900 font-mono mt-1">
+                {summaryMetrics.totalPortfolio.toLocaleString('ru-RU')}
               </div>
-
-              <div className="md:col-span-6 bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
-                <div className="flex justify-between items-center border-b border-slate-100 pb-3">
-                  <div>
-                    <h2 className="text-base font-bold text-slate-800">Журнал этапов пайплайна</h2>
-                    <p className="text-xs text-slate-500">
-                      Опрос статусов через <code>GET /api/runs/{'{id}'}/steps</code>
-                    </p>
-                  </div>
-                  <span className={`text-[11px] font-bold px-2 py-0.5 rounded ${
-                    isPipelineRunning ? 'bg-amber-100 text-amber-800 animate-pulse' : 'bg-emerald-100 text-emerald-800'
-                  }`}>
-                    {isPipelineRunning ? 'В ПРОЦЕССЕ' : 'ГОТОВ (ID: #' + reportId + ')'}
-                  </span>
-                </div>
-
-                <div className="space-y-3">
-                  {pipelineSteps.map((step) => {
-                    const isDone = step.status === 'done';
-                    const isRunning = step.status === 'running';
-
-                    return (
-                      <div
-                        key={step.id}
-                        className={`p-3 rounded-xl border transition flex items-center justify-between text-xs ${
-                          isRunning 
-                            ? 'bg-blue-50/60 border-blue-200' 
-                            : isDone 
-                            ? 'bg-slate-50 border-slate-200' 
-                            : 'bg-white border-slate-100 opacity-60'
-                        }`}
-                      >
-                        <div className="flex items-center gap-2.5">
-                          <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                            isDone 
-                              ? 'bg-emerald-600 text-white' 
-                              : isRunning 
-                              ? 'bg-blue-600 text-white animate-spin' 
-                              : 'bg-slate-200 text-slate-500'
-                          }`}>
-                            {isDone ? '✓' : isRunning ? '⟳' : '○'}
-                          </span>
-                          <div>
-                            <div className="font-semibold text-slate-800">{step.name}</div>
-                            <div className="text-[10px] text-slate-400">Время: {step.time}</div>
-                          </div>
-                        </div>
-
-                        <button
-                          onClick={() => openCodeModal(
-                            `Код этапа: ${step.name}`,
-                            PIPELINE_STEP_CODES[step.id] || '# Исходный код этапа выполняется на сервере\n',
-                            true
-                          )}
-                          className="px-2.5 py-1 rounded bg-white hover:bg-slate-100 border border-slate-200 text-slate-700 font-semibold transition cursor-pointer text-[11px]"
-                        >
-                          Код этапа ↗
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+              <div className="text-[11px] text-slate-400 mt-1">Данные витрины pivot-facts</div>
             </div>
 
-            {/* Персональная история запусков текущего аналитика */}
-            <div className="bg-white p-6 rounded-2xl border border-slate-200 shadow-xs space-y-4">
-              <div className="flex justify-between items-center border-b border-slate-100 pb-3">
-                <div>
-                  <h3 className="text-sm font-bold text-slate-800">
-                    История запусков пользователя: {currentUser} (User ID: {activeUserId})
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Отображает только прогоны, запущенные этой учётной записью
-                  </p>
-                </div>
-                <button
-                  onClick={() => fetchUserRuns(activeUserId)}
-                  className="text-xs text-blue-600 hover:underline font-semibold cursor-pointer"
-                >
-                  ↻ Обновить историю
-                </button>
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Смена кредитного решения (Flips)</div>
+              <div className="flex items-baseline justify-between mt-1">
+                <div className="text-2xl font-extrabold text-amber-600 font-mono">{summaryMetrics.totalFlips}</div>
+                <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                  {summaryMetrics.flipsPct}% выборки
+                </span>
               </div>
+              <div className="text-[11px] text-slate-400 mt-1">Анкеты с миграцией исхода</div>
+            </div>
 
-              {userRuns.length === 0 ? (
-                <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl text-xs text-slate-500 text-center">
-                  У этого пользователя пока нет отдельных сохранённых запусков. Запустите бэктест выше, и он появится здесь.
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Загружено в реестр</div>
+              <div className="flex items-baseline justify-between mt-1">
+                <div className="text-2xl font-extrabold text-blue-600 font-mono">{applications.length}</div>
+                <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700">Из базы FastAPI</span>
+              </div>
+              <div className="text-[11px] text-slate-400 mt-1">Доступен поатрибутный аудит</div>
+            </div>
+          </div>
+
+          {/* 2. ДИАГРАММА WATERFALL ПЕРЕТОКА РЕШЕНИЙ */}
+          {activeWaterfallRow && (
+            <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4">
+              <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-100 pb-3">
+                <div>
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600">
+                    Динамический баланс решений
+                  </span>
+                  <h3 className="text-sm font-bold text-slate-800">
+                    Диаграмма миграции (Waterfall): срез по исходу «{activeWaterfallRow.value}»
+                  </h3>
                 </div>
-              ) : (
-                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
-                  {userRuns.map((r) => (
-                    <div
-                      key={r.id || r.run_id}
-                      onClick={() => {
-                        const targetId = String(r.id || r.run_id);
-                        setReportId(targetId);
-                        fetchBackendData(targetId);
-                        setActiveTab('matrix');
-                      }}
-                      className={`p-3 rounded-xl border cursor-pointer transition flex flex-col justify-between ${
-                        reportId === String(r.id || r.run_id)
-                          ? 'border-blue-500 bg-blue-50/50'
-                          : 'border-slate-200 bg-white hover:bg-slate-50'
+
+                {/* Переключатель исходов для Waterfall (динамический) */}
+                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg text-xs font-semibold">
+                  <span className="text-slate-400 text-[11px] px-1 font-sans">Срез исхода:</span>
+                  {decisionRows.map((dr) => (
+                    <button
+                      key={dr.id}
+                      onClick={() => setWaterfallTargetBucket(dr.value)}
+                      className={`px-2.5 py-0.5 rounded-md transition cursor-pointer ${
+                        activeWaterfallRow.value === dr.value
+                          ? 'bg-white text-slate-900 shadow-sm font-bold'
+                          : 'text-slate-600 hover:text-slate-900'
                       }`}
                     >
-                      <div className="flex justify-between items-center mb-1">
-                        <span className="font-mono font-bold text-xs text-slate-800">
-                          Запуск #{r.id || r.run_id}
-                        </span>
-                        <span className="text-[10px] bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded font-bold">
-                          {r.status || 'done'}
-                        </span>
-                      </div>
-                      <div className="text-[11px] text-slate-500">
-                        {r.created_at ? new Date(r.created_at).toLocaleTimeString() : 'Завершён'}
-                      </div>
-                      <div className="mt-2 pt-2 border-t border-slate-100 text-right">
-                        <span className="text-[11px] text-blue-600 font-semibold">
-                          Открыть отчёт →
-                        </span>
-                      </div>
-                    </div>
+                      {dr.value}
+                    </button>
                   ))}
                 </div>
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ── ВКЛАДКА: СВОДНЫЙ ОТЧЁТ И ВИТРИНА ── */}
-        {activeTab === 'matrix' && (
-          <div className="space-y-6">
-            
-            {/* 1. КАРТОЧКИ БИЗНЕС-МЕТРИК ПОРТФЕЛЯ */}
-            <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
-                <div className="text-xs font-medium text-slate-500 mb-1">Уровень одобрения (APPROVE)</div>
-                <div className="flex items-baseline justify-between">
-                  <div className="text-2xl font-bold tracking-tight text-slate-900">{summaryMetrics.rateAfter}%</div>
-                  <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                    {summaryMetrics.rateDiff}
-                  </span>
-                </div>
-                <div className="text-[11px] text-slate-400 mt-1">
-                  MASTER: {summaryMetrics.rateBefore}% • Портфель: {summaryMetrics.totalPortfolio} анкет
-                </div>
               </div>
 
-              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
-                <div className="text-xs font-medium text-slate-500 mb-1">Смена решения (Flip)</div>
-                <div className="flex items-baseline justify-between">
-                  <div className="text-2xl font-bold tracking-tight text-slate-900">{summaryMetrics.flippedApps}</div>
-                  <span className="text-xs font-semibold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
-                    DIFF=1
-                  </span>
-                </div>
-                <div className="text-[11px] text-slate-400 mt-1">
-                  Стабильное решение: {summaryMetrics.stableApps} клиентов
-                </div>
-              </div>
+              {/* Столбики диаграммы */}
+              {(() => {
+                const maxVal = Math.max(
+                  activeWaterfallRow.masterTotal,
+                  activeWaterfallRow.betaTotal,
+                  activeWaterfallRow.stableCount,
+                  1
+                );
+                const getHeight = (val) => Math.max(Math.round((val / maxVal) * 110), 18);
 
-              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
-                <div className="text-xs font-medium text-slate-500 mb-1">Загружено заявок в реестр</div>
-                <div className="flex items-baseline justify-between">
-                  <div className="text-2xl font-bold tracking-tight text-blue-600">
-                    {registeredAppList.length}
-                  </div>
-                  <span className="text-xs font-semibold text-blue-800 bg-blue-50 px-1.5 py-0.5 rounded">
-                    из базы FastAPI
-                  </span>
-                </div>
-                <div className="text-[11px] text-slate-400 mt-1">
-                  Все ID доступны для открытия досье
-                </div>
-              </div>
+                const bars = [
+                  {
+                    label: 'MASTER (Было)',
+                    val: activeWaterfallRow.masterTotal,
+                    sub: 'было в срезе',
+                    color: 'bg-slate-700 hover:bg-slate-800',
+                    textColor: 'text-slate-800',
+                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ALL' })
+                  },
+                  {
+                    label: 'Сохранено (DIFF=0)',
+                    val: activeWaterfallRow.stableCount,
+                    sub: 'без изменений',
+                    color: 'bg-slate-400 hover:bg-slate-500',
+                    textColor: 'text-slate-600',
+                    onClick: null
+                  },
+                  {
+                    label: 'Ушло в другие (-)',
+                    val: activeWaterfallRow.leftCount,
+                    prefix: '-',
+                    sub: 'клик ➔ анкеты',
+                    color: 'bg-rose-500 hover:bg-rose-600 ring-2 ring-rose-200',
+                    textColor: 'text-rose-600 font-bold',
+                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'LEFT' })
+                  },
+                  {
+                    label: 'Пришло из других (+)',
+                    val: activeWaterfallRow.arrivedCount,
+                    prefix: '+',
+                    sub: 'клик ➔ анкеты',
+                    color: 'bg-emerald-500 hover:bg-emerald-600 ring-2 ring-emerald-200',
+                    textColor: 'text-emerald-600 font-bold',
+                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ARRIVED' })
+                  },
+                  {
+                    label: 'BETA (Стало)',
+                    val: activeWaterfallRow.betaTotal,
+                    sub: `дельта: ${activeWaterfallRow.netDelta >= 0 ? '+' : ''}${activeWaterfallRow.netDelta}`,
+                    color: 'bg-blue-600 hover:bg-blue-700',
+                    textColor: 'text-blue-700 font-bold',
+                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ARRIVED' })
+                  }
+                ];
 
-              <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-xs">
-                <div className="text-xs font-medium text-slate-500 mb-1">Баланс перетока одобрений</div>
-                <div className="flex items-baseline justify-between">
-                  <div className="text-2xl font-bold tracking-tight text-emerald-600">
-                    +{transitionMatrix.approveGained} <span className="text-rose-600 text-lg">/ -{transitionMatrix.approveLost}</span>
-                  </div>
-                  <span className="text-xs font-semibold text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded">
-                    Приток / Отсев
-                  </span>
-                </div>
-                <div className="text-[11px] text-slate-400 mt-1">
-                  Чистая дельта: +{transitionMatrix.approveGained - transitionMatrix.approveLost} одобрений
-                </div>
-              </div>
-            </div>
-
-            {/* 2. ДИНАМИЧЕСКИЙ БЛОК АВТОПРОВЕРОК (QUALITY GATES) */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-              <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex flex-wrap justify-between items-center gap-2">
-                <div>
-                  <h2 className="text-sm font-bold text-slate-800">Автоматические проверки стратегии (Quality Gates)</h2>
-                  <p className="text-[11px] text-slate-500">
-                    Кликните по названию или кнопке «Срез», чтобы развернуть детальную таблицу параметров
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                    PASS: {qualityGates.filter((g) => g.status === 'PASS').length}
-                  </span>
-                  <span className="text-xs font-semibold px-2 py-0.5 rounded bg-rose-100 text-rose-800">
-                    FAIL: {qualityGates.filter((g) => g.status === 'FAIL').length}
-                  </span>
-                </div>
-              </div>
-
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-white text-slate-500 border-b border-slate-200">
-                    <tr>
-                      <th className="py-2.5 px-4 font-semibold">Контрольная проверка</th>
-                      <th className="py-2.5 px-4 font-semibold">Модуль (CLASS)</th>
-                      <th className="py-2.5 px-4 font-semibold">Порог политики</th>
-                      <th className="py-2.5 px-4 font-semibold">Факт по витрине</th>
-                      <th className="py-2.5 px-4 font-semibold text-center">Статус</th>
-                      <th className="py-2.5 px-4 font-semibold text-right">Действия</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {qualityGates.map((gate) => {
-                      const isSelected = selectedQualityGateId === gate.id;
-                      const matchingBlock = groupedParameterBlocks.find(
-                        (b) => b.className.toLowerCase().trim() === (gate.targetClass || '').toLowerCase().trim()
-                      );
-
-                      return (
-                        <React.Fragment key={gate.id}>
-                          <tr
-                            onClick={() => setSelectedQualityGateId(isSelected ? null : gate.id)}
-                            className={`cursor-pointer transition ${
-                              isSelected ? 'bg-blue-50/70 font-semibold' : 'hover:bg-slate-50'
-                            }`}
-                          >
-                            <td className="py-2.5 px-4 text-slate-800">
-                              <span className="mr-1.5 text-slate-400 font-bold">{isSelected ? '▼' : '▶'}</span>
-                              {gate.name}
-                            </td>
-                            <td className="py-2.5 px-4 font-mono text-slate-600">
-                              <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px] font-semibold">{gate.targetClass}</span>
-                            </td>
-                            <td className="py-2.5 px-4 text-slate-500 font-mono">{gate.threshold}</td>
-                            <td className="py-2.5 px-4 font-mono font-semibold text-slate-900">{gate.metric}</td>
-                            <td className="py-2.5 px-4 text-center">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                gate.status === 'PASS'
-                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                                  : 'bg-rose-100 text-rose-800 border border-rose-200'
-                              }`}>
-                                {gate.status}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-4 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    openCodeModal(`Логика правила: ${gate.name}`, gate.codeSnippet || '# Код проверки\n', true);
-                                  }}
-                                  className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer"
-                                >
-                                  Код ↗
-                                </button>
-                                <button
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    setSelectedQualityGateId(isSelected ? null : gate.id);
-                                  }}
-                                  className="text-[11px] text-blue-600 hover:underline font-semibold cursor-pointer"
-                                >
-                                  {isSelected ? 'Скрыть ▲' : 'Срез ▼'}
-                                </button>
-                                {gate.isCustom && (
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      handleDeleteCustomCheck(gate.id);
-                                    }}
-                                    className="text-[11px] text-rose-500 hover:text-rose-700 px-1 py-0.5 rounded font-bold cursor-pointer"
-                                    title="Удалить пользовательское правило"
-                                  >
-                                    ✕
-                                  </button>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-
-                          {isSelected && (
-                            <tr>
-                              <td colSpan={6} className="p-4 bg-slate-50 border-y border-blue-200">
-                                {matchingBlock ? (
-                                  <div className="bg-white rounded-xl border border-slate-200 p-3 space-y-2 shadow-xs">
-                                    <div className="flex justify-between items-center">
-                                      <span className="text-xs font-bold text-slate-800">
-                                        Параметры модуля «{matchingBlock.className}» ({matchingBlock.rows.length} бакетов):
-                                      </span>
-                                      <button
-                                        onClick={() => setSelectedQualityGateId(null)}
-                                        className="text-xs text-slate-400 hover:text-slate-700 cursor-pointer"
-                                      >
-                                        ✕ Скрыть панель
-                                      </button>
-                                    </div>
-                                    <table className="w-full text-left text-[11px] font-mono">
-                                      <thead className="bg-slate-50 text-slate-500 font-sans">
-                                        <tr>
-                                          <th className="py-1.5 px-3">Параметр (KEY)</th>
-                                          <th className="py-1.5 px-3">Бакет (VALUE)</th>
-                                          <th className="py-1.5 px-3 text-center">DIFF=0 (Стабильно)</th>
-                                          <th className="py-1.5 px-3 text-center text-rose-700">Ушло (BEFORE)</th>
-                                          <th className="py-1.5 px-3 text-center text-emerald-700">Пришло (AFTER)</th>
-                                          <th className="py-1.5 px-3 text-center">Чистый сдвиг (Δ)</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody className="divide-y divide-slate-100">
-                                        {matchingBlock.rows.map((r) => (
-                                          <tr key={r.id} className={r.totalChanges > 0 ? 'bg-amber-50/40' : ''}>
-                                            <td className="py-1.5 px-3 font-semibold text-slate-700">{r.arrayKey ? `${r.arrayKey}.${r.key}` : r.key || '—'}</td>
-                                            <td className="py-1.5 px-3 font-bold text-slate-900">{r.value}</td>
-                                            <td className="py-1.5 px-3 text-center text-slate-500">{r.stableCount}</td>
-                                            <td className="py-1.5 px-3 text-center text-rose-600 font-bold">{r.leftCount > 0 ? `-${r.leftCount}` : '0'}</td>
-                                            <td className="py-1.5 px-3 text-center text-emerald-600 font-bold">{r.arrivedCount > 0 ? `+${r.arrivedCount}` : '0'}</td>
-                                            <td className="py-1.5 px-3 text-center font-bold">{r.netDelta > 0 ? `+${r.netDelta}` : r.netDelta}</td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </div>
-                                ) : (
-                                  <div className="bg-white rounded-xl border border-slate-200 p-4 text-xs text-slate-600 flex justify-between items-center">
-                                    <span>
-                                      Для модуля <b>{gate.targetClass}</b> в текущем отчёте не найдено записей с расхождениями.
-                                    </span>
-                                    <button
-                                      onClick={() => setSelectedQualityGateId(null)}
-                                      className="text-xs text-slate-400 hover:text-slate-700 cursor-pointer"
-                                    >
-                                      ✕ Закрыть
-                                    </button>
-                                  </div>
-                                )}
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* 3. ТАБЛИЦА РЕШЕНИЙ С ИНЛАЙН MASTER-DETAIL */}
-            <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-              <div className="px-5 py-3.5 bg-slate-900 text-white flex flex-wrap justify-between items-center gap-2">
-                <div>
-                  <h2 className="text-sm font-bold">Итоговые решения и сегменты модели</h2>
-                  <p className="text-[11px] text-slate-300">
-                    Клик по названию модуля или по кнопке перетока раскрывает параметры и заявки прямо под строкой
-                  </p>
-                </div>
-                {expandedSegmentClass && (
-                  <button
-                    onClick={() => {
-                      setExpandedSegmentClass(null);
-                      setSelectedPivotFilter(null);
-                    }}
-                    className="text-xs bg-white/15 hover:bg-white/25 text-white px-2.5 py-1 rounded transition cursor-pointer"
-                  >
-                    ✕ Свернуть срез
-                  </button>
-                )}
-              </div>
-
-              <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
-                    <tr>
-                      <th className="py-2.5 px-4 font-semibold">Модуль / Сегмент</th>
-                      <th className="py-2.5 px-4 font-semibold">Исход (VALUE)</th>
-                      <th className="py-2.5 px-4 font-semibold text-center">MASTER</th>
-                      <th className="py-2.5 px-4 font-semibold text-center text-slate-500">DIFF=0 (Стабильно)</th>
-                      <th className="py-2.5 px-4 font-semibold text-center text-rose-700 bg-rose-50/40">Ушло (BEFORE)</th>
-                      <th className="py-2.5 px-4 font-semibold text-center text-emerald-700 bg-emerald-50/40">Пришло (AFTER)</th>
-                      <th className="py-2.5 px-4 font-semibold text-center">BETA</th>
-                      <th className="py-2.5 px-4 font-semibold text-center">Чистый итог (Δ)</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 font-mono">
-                    {decisionSummaryRows.map((row) => {
-                      const targetKey = `${row.class}__${row.value}`;
-                      const isRowExpanded = expandedSegmentClass === targetKey;
-                      const parentBlock = groupedParameterBlocks.find((b) => b.className === row.class);
-
-                      return (
-                        <React.Fragment key={row.id}>
-                          <tr
-                            onClick={() => {
-                              if (expandedSegmentClass === targetKey) {
-                                setExpandedSegmentClass(null);
-                                setSelectedPivotFilter(null);
-                              } else {
-                                setExpandedSegmentClass(targetKey);
-                                setSelectedPivotFilter({
-                                  class: row.class,
-                                  arrayKey: row.arrayKey,
-                                  key: row.key,
-                                  value: row.value,
-                                  direction: 'ALL',
-                                  expectedCount: row.leftCount + row.arrivedCount
-                                });
-                              }
-                            }}
-                            className={`cursor-pointer transition ${
-                              isRowExpanded ? 'bg-blue-50/70 font-semibold' : 'hover:bg-slate-50'
-                            }`}
-                          >
-                            <td className="py-2.5 px-4 font-sans font-medium text-slate-700">
-                              <span className="inline-flex items-center gap-1.5 bg-slate-100 hover:bg-blue-100 text-slate-800 px-2.5 py-1 rounded text-[11px] font-semibold transition">
-                                <span className="text-blue-600">{isRowExpanded ? '▼' : '▶'}</span>
-                                {row.class}{row.arrayKey ? ` • ${row.arrayKey}` : ''}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-4 font-bold text-slate-900">{row.value}</td>
-                            <td className="py-2.5 px-4 text-center text-slate-700 font-bold">{row.totalBefore}</td>
-                            <td className="py-2.5 px-4 text-center text-slate-500">{row.stableCount}</td>
-
-                            <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans" onClick={(e) => e.stopPropagation()}>
-                              {row.leftCount > 0 ? (
-                                <button
-                                  onClick={() => handleDrillDown(row, 'LEFT')}
-                                  className="px-2.5 py-0.5 rounded bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800 font-mono font-bold text-xs transition cursor-pointer"
-                                >
-                                  -{row.leftCount} ▼
-                                </button>
-                              ) : (
-                                <span className="text-slate-300">0</span>
-                              )}
-                            </td>
-
-                            <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans" onClick={(e) => e.stopPropagation()}>
-                              {row.arrivedCount > 0 ? (
-                                <button
-                                  onClick={() => handleDrillDown(row, 'ARRIVED')}
-                                  className="px-2.5 py-0.5 rounded bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800 font-mono font-bold text-xs transition cursor-pointer"
-                                >
-                                  +{row.arrivedCount} ▼
-                                </button>
-                              ) : (
-                                <span className="text-slate-300">0</span>
-                              )}
-                            </td>
-
-                            <td className="py-2.5 px-4 text-center text-slate-900 font-bold">{row.totalAfter}</td>
-                            <td className="py-2.5 px-4 text-center font-sans font-bold">
-                              {row.netDelta > 0 ? (
-                                <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">+{row.netDelta}</span>
-                              ) : row.netDelta < 0 ? (
-                                <span className="bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded">{row.netDelta}</span>
-                              ) : (
-                                <span className="text-slate-400">0</span>
-                              )}
-                            </td>
-                          </tr>
-
-                          {isRowExpanded && (
-                            <tr>
-                              <td colSpan={8} className="p-4 bg-blue-50/30 border-y border-blue-200 font-sans">
-                                <div className="bg-white rounded-xl border border-slate-200 p-4 space-y-4 shadow-xs">
-                                  <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-100 pb-3">
-                                    <div>
-                                      <span className="text-xs font-bold uppercase tracking-wider text-blue-600">
-                                        Активный фильтр среза
-                                      </span>
-                                      <h4 className="text-sm font-bold text-slate-800">
-                                        {row.class} = {row.value}
-                                        {selectedPivotFilter?.direction === 'LEFT' && ' (Только ушедшие)'}
-                                        {selectedPivotFilter?.direction === 'ARRIVED' && ' (Только пришедшие)'}
-                                      </h4>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                      <button
-                                        onClick={() => setActiveTab('registry')}
-                                        className="px-3 py-1 bg-slate-900 hover:bg-blue-600 text-white rounded-lg text-xs font-semibold transition cursor-pointer"
-                                      >
-                                        Перейти в реестр ({filteredApps.length}) →
-                                      </button>
-                                      <button
-                                        onClick={() => {
-                                          setExpandedSegmentClass(null);
-                                          setSelectedPivotFilter(null);
-                                        }}
-                                        className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-lg text-xs font-semibold cursor-pointer"
-                                      >
-                                        ✕ Закрыть
-                                      </button>
-                                    </div>
-                                  </div>
-
-                                  {parentBlock && (
-                                    <div>
-                                      <div className="text-xs font-semibold text-slate-600 mb-2">
-                                        Параметры модуля «{row.class}» ({parentBlock.rows.length} бакетов):
-                                      </div>
-                                      <div className="overflow-x-auto border border-slate-200 rounded-lg">
-                                        <table className="w-full text-left text-xs font-mono">
-                                          <thead className="bg-slate-50 text-slate-500 font-sans border-b border-slate-200">
-                                            <tr>
-                                              <th className="py-1.5 px-3">Параметр (KEY)</th>
-                                              <th className="py-1.5 px-3">Бакет</th>
-                                              <th className="py-1.5 px-3 text-center">Стабильно</th>
-                                              <th className="py-1.5 px-3 text-center text-rose-700">Ушло</th>
-                                              <th className="py-1.5 px-3 text-center text-emerald-700">Пришло</th>
-                                              <th className="py-1.5 px-3 text-center">Дельта</th>
-                                            </tr>
-                                          </thead>
-                                          <tbody className="divide-y divide-slate-100">
-                                            {parentBlock.rows.map((subRow) => (
-                                              <tr
-                                                key={subRow.id}
-                                                className={subRow.value === row.value ? 'bg-blue-50/60 font-bold' : ''}
-                                              >
-                                                <td className="py-1.5 px-3">{subRow.arrayKey ? `${subRow.arrayKey}.${subRow.key}` : subRow.key}</td>
-                                                <td className="py-1.5 px-3">{subRow.value}</td>
-                                                <td className="py-1.5 px-3 text-center text-slate-500">{subRow.stableCount}</td>
-                                                <td className="py-1.5 px-3 text-center text-rose-600">-{subRow.leftCount}</td>
-                                                <td className="py-1.5 px-3 text-center text-emerald-600">+{subRow.arrivedCount}</td>
-                                                <td className="py-1.5 px-3 text-center">{subRow.netDelta > 0 ? `+${subRow.netDelta}` : subRow.netDelta}</td>
-                                              </tr>
-                                            ))}
-                                          </tbody>
-                                        </table>
-                                      </div>
-                                    </div>
-                                  )}
-
-                                  <div>
-                                    <div className="text-xs font-semibold text-slate-600 mb-2">
-                                      Заявки из базы, подходящие под статус {row.value}:
-                                    </div>
-                                    {filteredApps.length > 0 ? (
-                                      <div className="flex flex-wrap gap-2">
-                                        {filteredApps.slice(0, 10).map((app) => (
-                                          <button
-                                            key={app.id}
-                                            onClick={() => handleOpenDossier(app.id)}
-                                            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-blue-600 text-white text-xs font-mono font-semibold transition cursor-pointer shadow-xs"
-                                          >
-                                            <span>📄 {app.id}</span>
-                                            <span className="text-[10px] bg-white/20 px-1 py-0.5 rounded font-sans font-normal">
-                                              {app.afterDecision}
-                                            </span>
-                                          </button>
-                                        ))}
-                                      </div>
-                                    ) : (
-                                      <div className="text-xs text-slate-500 bg-slate-50 p-3 rounded-lg border border-slate-200">
-                                        В текущей выборке нет заявок со статусом {row.value}.
-                                      </div>
-                                    )}
-                                  </div>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {/* 4. БЛОКИ ПАРАМЕТРОВ МОДЕЛИ */}
-            <div className="space-y-4">
-              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs flex flex-wrap justify-between items-center gap-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <input
-                    type="text"
-                    placeholder="Поиск по модулю, атрибуту или значению..."
-                    value={currentWorkspace.searchFilter}
-                    onChange={(e) => updateCurrentWorkspace({ searchFilter: e.target.value })}
-                    className="bg-slate-50 border border-slate-300 rounded-xl px-3.5 py-1.5 text-xs outline-none focus:border-blue-500 w-72"
-                  />
-                  <button
-                    onClick={() => updateCurrentWorkspace({ onlyDiffRows: !currentWorkspace.onlyDiffRows })}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                      currentWorkspace.onlyDiffRows
-                        ? 'bg-amber-500 text-white border-amber-500'
-                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
-                    }`}
-                  >
-                    {currentWorkspace.onlyDiffRows ? '● Только расхождения (DIFF=1)' : '○ Все бакеты'}
-                  </button>
-                  <button
-                    onClick={() => updateCurrentWorkspace({ sortByImpact: !currentWorkspace.sortByImpact })}
-                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border transition cursor-pointer ${
-                      currentWorkspace.sortByImpact
-                        ? 'bg-slate-800 text-white border-slate-800'
-                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
-                    }`}
-                  >
-                    {currentWorkspace.sortByImpact ? '↓ Сортировка по клиентам' : 'По порядку витрины'}
-                  </button>
-                </div>
-
-                <div className="text-xs text-slate-500">
-                  Модулей витрины: <b>{groupedParameterBlocks.length}</b>
-                </div>
-              </div>
-
-              {displayedBlocks.map((block) => {
-                const isCollapsed = !!collapsedClasses[block.className];
                 return (
-                  <div key={block.className} className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-                    <div
-                      onClick={() => toggleClassCollapse(block.className)}
-                      className="px-5 py-3 bg-slate-50/80 hover:bg-slate-100/80 border-b border-slate-200 flex flex-wrap justify-between items-center gap-2 cursor-pointer transition"
-                    >
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs font-bold text-slate-400">{isCollapsed ? '▶' : '▼'}</span>
-                        <span className="font-bold text-sm text-slate-800">{block.className}</span>
-                        <span className="text-xs text-slate-500">({block.rows.length} бакетов)</span>
-                      </div>
-
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs font-medium text-slate-600 bg-white border border-slate-200 px-2.5 py-0.5 rounded">
-                          Изменилось: <b>{block.affectedParams} из {block.totalParams}</b> параметров
-                        </span>
-                        <span className={`text-xs font-bold px-2.5 py-0.5 rounded ${
-                          block.maxAffectedClients > 0 ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
-                        }`}>
-                          Макс. сдвиг: до {block.maxAffectedClients} клиентов
-                        </span>
-                      </div>
+                  <div className="pt-2 pb-1 px-3 bg-slate-50/80 rounded-xl border border-slate-100">
+                    <div className="grid grid-cols-5 gap-3 items-end h-36 pt-4 px-2">
+                      {bars.map((b, idx) => (
+                        <div
+                          key={idx}
+                          onClick={b.onClick || undefined}
+                          className={`flex flex-col items-center justify-end h-full ${b.onClick ? 'cursor-pointer group' : ''}`}
+                        >
+                          <div className={`text-xs font-mono mb-1 ${b.textColor}`}>
+                            {b.prefix || ''}{b.val}
+                          </div>
+                          <div
+                            style={{ height: `${getHeight(b.val)}px` }}
+                            className={`w-full max-w-16 rounded-t-lg transition-all duration-300 shadow-sm ${b.color}`}
+                          />
+                        </div>
+                      ))}
                     </div>
-
-                    {!isCollapsed && (
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left text-xs">
-                          <thead className="bg-white text-slate-500 border-b border-slate-100">
-                            <tr>
-                              <th className="py-2 px-4 font-semibold">Параметр (KEY)</th>
-                              <th className="py-2 px-4 font-semibold">Бакет (VALUE)</th>
-                              <th className="py-2 px-4 font-semibold text-center">DIFF=0</th>
-                              <th className="py-2 px-4 font-semibold text-center text-rose-700">Ушло (BEFORE)</th>
-                              <th className="py-2 px-4 font-semibold text-center text-emerald-700">Пришло (AFTER)</th>
-                              <th className="py-2 px-4 font-semibold text-center">Дельта (Δ)</th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y divide-slate-100 font-mono">
-                            {block.rows.map((row) => {
-                              const hasDiff = row.totalChanges > 0;
-
-                              return (
-                                <tr key={row.id} className={hasDiff ? 'bg-amber-50/20 hover:bg-amber-50/50' : 'hover:bg-slate-50'}>
-                                  <td className="py-2 px-4 text-slate-700 font-medium">
-                                    {row.arrayKey ? `${row.arrayKey}${row.key ? '.' + row.key : ''}` : row.key || '—'}
-                                  </td>
-                                  <td className="py-2 px-4 font-bold text-slate-900">{row.value}</td>
-                                  <td className="py-2 px-4 text-center text-slate-500">{row.stableCount}</td>
-
-                                  <td className="py-2 px-4 text-center font-sans">
-                                    {row.leftCount > 0 ? (
-                                      <button
-                                        onClick={() => handleDrillDown(row, 'LEFT')}
-                                        className="px-2 py-0.5 rounded bg-rose-50 hover:bg-rose-600 hover:text-white text-rose-700 border border-rose-200 font-mono font-bold transition cursor-pointer"
-                                      >
-                                        -{row.leftCount}
-                                      </button>
-                                    ) : (
-                                      <span className="text-slate-300">0</span>
-                                    )}
-                                  </td>
-
-                                  <td className="py-2 px-4 text-center font-sans">
-                                    {row.arrivedCount > 0 ? (
-                                      <button
-                                        onClick={() => handleDrillDown(row, 'ARRIVED')}
-                                        className="px-2 py-0.5 rounded bg-emerald-50 hover:bg-emerald-600 hover:text-white text-emerald-700 border border-emerald-200 font-mono font-bold transition cursor-pointer"
-                                      >
-                                        +{row.arrivedCount}
-                                      </button>
-                                    ) : (
-                                      <span className="text-slate-300">0</span>
-                                    )}
-                                  </td>
-
-                                  <td className="py-2 px-4 text-center font-sans font-bold">
-                                    {row.netDelta > 0 ? (
-                                      <span className="text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">+{row.netDelta}</span>
-                                    ) : row.netDelta < 0 ? (
-                                      <span className="text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded">{row.netDelta}</span>
-                                    ) : (
-                                      <span className="text-slate-400">0</span>
-                                    )}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-                    )}
+                    <div className="grid grid-cols-5 gap-3 border-t border-slate-200 pt-2 pb-1 text-center font-sans">
+                      {bars.map((b, idx) => (
+                        <div key={idx}>
+                          <div className="text-[11px] font-bold text-slate-700 leading-tight">{b.label}</div>
+                          <div className="text-[10px] text-slate-400 mt-0.5">{b.sub}</div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 );
-              })}
+              })()}
+            </div>
+          )}
+
+          {/* 3. ПРОВЕРКИ РИСК-ПОЛИТИКИ ИЗ РЕПОЗИТОРИЯ (GET /api/reports/{id}/checks) */}
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+              <div>
+                <h3 className="text-sm font-bold text-slate-800">Автоматические проверки стратегии (Quality Gates)</h3>
+                <p className="text-[11px] text-slate-500">Результаты расчета проверок из репозитория проекта</p>
+              </div>
+              <div className="flex gap-2 text-xs font-bold">
+                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
+                  PASS: {checksResults.filter((c) => (c.RESULT || c.result) === 'PASS').length}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800">
+                  FAIL: {checksResults.filter((c) => (c.RESULT || c.result) === 'FAIL').length}
+                </span>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-white text-slate-500 border-b border-slate-200 font-semibold">
+                  <tr>
+                    <th className="py-2.5 px-4">Название проверки (LABEL)</th>
+                    <th className="py-2.5 px-4">Аргумент</th>
+                    <th className="py-2.5 px-4 text-center">Затронуто анкет (CNT)</th>
+                    <th className="py-2.5 px-4 text-center">Метрика</th>
+                    <th className="py-2.5 px-4 text-center">Статус</th>
+                    <th className="py-2.5 px-4 text-right">Код</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {checksResults.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-4 text-center text-slate-400">
+                        Нет сохраненных результатов проверок в базе для этого прогона
+                      </td>
+                    </tr>
+                  ) : (
+                    checksResults.map((c, idx) => {
+                      const label = c.LABEL || c.label || 'Проверка';
+                      const res = c.RESULT || c.result || 'PASS';
+                      const arg = c.ARGUMENT || c.argument || '—';
+                      const cnt = c.CNT ?? c.cnt ?? 0;
+                      const metric = c.METRIC ?? c.metric ?? '—';
+                      const checkId = Object.keys(REPO_PYTHON_SCRIPTS).find((k) => label.toLowerCase().includes(k)) || 'ar_drop_by_product';
+
+                      return (
+                        <tr key={idx} className="hover:bg-slate-50 transition">
+                          <td className="py-2.5 px-4 font-semibold text-slate-800">{label}</td>
+                          <td className="py-2.5 px-4 font-mono text-slate-600">
+                            <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px]">{arg}</span>
+                          </td>
+                          <td className="py-2.5 px-4 text-center font-mono font-bold text-slate-800">{cnt}</td>
+                          <td className="py-2.5 px-4 text-center font-mono text-slate-700">{metric}</td>
+                          <td className="py-2.5 px-4 text-center">
+                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                              res === 'PASS'
+                                ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                : 'bg-rose-100 text-rose-800 border border-rose-200'
+                            }`}>
+                              {res}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-4 text-right">
+                            <button
+                              onClick={() => setCodeModal({ isOpen: true, title: label, code: REPO_PYTHON_SCRIPTS[checkId] || '# Код проверки в репозитории\n' })}
+                              className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer"
+                            >
+                              Код ↗
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
             </div>
           </div>
-        )}
 
-        {/* ── ВКЛАДКА: РЕЕСТР И ПОИСК ЗАЯВОК ── */}
-        {activeTab === 'registry' && (
-          <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs space-y-4 p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-4">
+          {/* 4. ПОЛНЫЙ БАЛАНС ПЕРЕТОКА РЕШЕНИЙ (УНИВЕРСАЛЬНЫЙ DATA-AGNOSTIC) */}
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-5 py-3.5 bg-slate-900 text-white flex justify-between items-center">
               <div>
-                <h2 className="text-base font-bold text-slate-800">Реестр заявок из базы FastAPI (Отчёт #{reportId})</h2>
-                <p className="text-xs text-slate-500">
-                  Всего получено из API: <b>{registeredAppList.length}</b> заявок.
+                <h3 className="text-sm font-bold">Сводный баланс кредитных решений (Полная арифметика перетока)</h3>
+                <p className="text-[11px] text-slate-300">
+                  Формула: <code>MASTER (Было)</code> - <code>Ушло</code> + <code>Пришло</code> = <code>BETA (Стало)</code>
                 </p>
               </div>
-
               {selectedPivotFilter && (
                 <button
                   onClick={() => setSelectedPivotFilter(null)}
-                  className="px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-100 rounded-xl border border-slate-300 transition cursor-pointer"
+                  className="text-xs bg-white/20 hover:bg-white/30 text-white px-2.5 py-1 rounded transition cursor-pointer"
                 >
-                  ✕ Сбросить фильтр: {selectedPivotFilter.value}
+                  ✕ Сбросить фильтр с таблицы ({selectedPivotFilter.value})
                 </button>
               )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 bg-slate-50 p-4 rounded-xl border border-slate-200">
-              <span className="text-xs font-medium text-slate-700">APP_ID:</span>
-              <input
-                type="text"
-                placeholder="например: I32554354"
-                value={manualAppInput}
-                onChange={(e) => setManualAppInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleOpenDossier(manualAppInput)}
-                className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs font-mono outline-none focus:border-blue-500 w-64"
-              />
-              <button
-                onClick={() => handleOpenDossier(manualAppInput)}
-                disabled={isDossierLoading}
-                className="bg-slate-900 hover:bg-blue-600 text-white px-4 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer disabled:opacity-50"
-              >
-                {isDossierLoading ? 'Запрос...' : 'Открыть досье'}
-              </button>
-            </div>
-
-            <div className="overflow-x-auto border border-slate-200 rounded-xl">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs font-mono">
+                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
                   <tr>
-                    <th className="py-2.5 px-3 font-semibold">ID заявки</th>
-                    <th className="py-2.5 px-3 font-semibold">Решение в BETA (decision_after)</th>
-                    <th className="py-2.5 px-3 font-semibold">Расхождений (diff_count)</th>
-                    <th className="py-2.5 px-3 font-semibold text-center">Досье</th>
+                    <th className="py-2.5 px-4">Параметр (KEY)</th>
+                    <th className="py-2.5 px-4">Исход (VALUE)</th>
+                    <th className="py-2.5 px-4 text-center font-bold text-slate-800">MASTER (Было)</th>
+                    <th className="py-2.5 px-4 text-center text-slate-500">Без изменений (DIFF=0)</th>
+                    <th className="py-2.5 px-4 text-center text-rose-700 bg-rose-50/50">Ушло в др. (-LEFT)</th>
+                    <th className="py-2.5 px-4 text-center text-emerald-700 bg-emerald-50/50">Пришло из др. (+ARRIVED)</th>
+                    <th className="py-2.5 px-4 text-center font-bold text-slate-900">BETA (Стало)</th>
+                    <th className="py-2.5 px-4 text-center font-sans">Чистый сдвиг (Δ)</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-slate-100 font-mono">
-                  {filteredApps.map((app) => (
-                    <tr
-                      key={app.id}
-                      onClick={() => handleOpenDossier(app.id)}
-                      className="hover:bg-blue-50/40 cursor-pointer transition"
-                    >
-                      <td className="py-3 px-3 font-bold text-slate-900">{app.id}</td>
-                      <td className="py-3 px-3">
-                        <span className={`font-bold px-2 py-0.5 rounded text-xs ${
-                          app.afterDecision === 'APPROVE' 
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : app.afterDecision === 'REJECT'
-                            ? 'bg-rose-100 text-rose-800'
-                            : 'bg-slate-100 text-slate-700'
-                        }`}>
-                          {app.afterDecision}
-                        </span>
+                <tbody className="divide-y divide-slate-100">
+                  {decisionRows.map((r) => (
+                    <tr key={r.id} className="hover:bg-slate-50">
+                      <td className="py-2.5 px-4 font-sans text-slate-600">{r.key}</td>
+                      <td className="py-2.5 px-4 font-bold text-slate-900">{r.value}</td>
+                      <td className="py-2.5 px-4 text-center font-bold text-slate-800">{r.masterTotal}</td>
+                      <td className="py-2.5 px-4 text-center text-slate-400">{r.stableCount}</td>
+
+                      <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans">
+                        {r.leftCount > 0 ? (
+                          <button
+                            onClick={() => setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'LEFT' })}
+                            className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
+                              selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'LEFT'
+                                ? 'bg-rose-600 text-white ring-2 ring-rose-300'
+                                : 'bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800'
+                            }`}
+                            title="Отфильтровать анкеты, ушедшие из этого исхода"
+                          >
+                            -{r.leftCount} ▼
+                          </button>
+                        ) : '0'}
                       </td>
-                      <td className="py-3 px-3 text-slate-700">
-                        <span className="font-semibold text-amber-700">{app.diffCount}</span> шт.
+
+                      <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans">
+                        {r.arrivedCount > 0 ? (
+                          <button
+                            onClick={() => setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'ARRIVED' })}
+                            className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
+                              selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'ARRIVED'
+                                ? 'bg-emerald-600 text-white ring-2 ring-emerald-300'
+                                : 'bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800'
+                            }`}
+                            title="Отфильтровать анкеты, пришедшие в этот исход"
+                          >
+                            +{r.arrivedCount} ▼
+                          </button>
+                        ) : '0'}
                       </td>
-                      <td className="py-3 px-3 text-center font-sans">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleOpenDossier(app.id);
-                          }}
-                          className="text-xs bg-slate-900 hover:bg-blue-600 text-white px-2.5 py-1 rounded font-semibold transition cursor-pointer"
-                        >
-                          Поля diff →
-                        </button>
+
+                      <td className="py-2.5 px-4 text-center font-bold text-slate-900">{r.betaTotal}</td>
+                      <td className="py-2.5 px-4 text-center font-bold font-sans">
+                        {r.netDelta > 0 ? (
+                          <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">+{r.netDelta}</span>
+                        ) : r.netDelta < 0 ? (
+                          <span className="bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded">{r.netDelta}</span>
+                        ) : '0'}
                       </td>
                     </tr>
                   ))}
@@ -1816,99 +996,377 @@ export default function App() {
               </table>
             </div>
           </div>
-        )}
 
-      </main>
+          {/* 5. ВИТРИНА МОДУЛЕЙ С ПАРАМЕТРАМИ */}
+          <div className="space-y-4">
+            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-wrap justify-between items-center gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  placeholder="Поиск по модулю, признаку или бакету..."
+                  value={searchFilter}
+                  onChange={(e) => setSearchFilter(e.target.value)}
+                  className="bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none w-64 focus:border-blue-500"
+                />
 
-      {/* ── БОКОВАЯ ШТОРКА (ПОАТРИБУТНЫЙ ДИФФ ЗАЯВКИ) ── */}
-      {activeDossierApp && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-xs">
+                <button
+                  onClick={() => setOnlyDiffRows(!onlyDiffRows)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer ${
+                    onlyDiffRows ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  Только расхождения (DIFF=1)
+                </button>
+
+                <button
+                  onClick={() => setSignificantOnly(!significantOnly)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer ${
+                    significantOnly ? 'bg-rose-600 text-white border-rose-600' : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-50'
+                  }`}
+                >
+                  Сдвиги ≥ 10 анкет
+                </button>
+
+                <button
+                  onClick={() => setSortMode(sortMode === 'impact' ? 'delta' : sortMode === 'delta' ? 'alpha' : 'impact')}
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-blue-600 transition cursor-pointer"
+                >
+                  {sortMode === 'impact' && '↓ По охвату клиентов'}
+                  {sortMode === 'delta' && '↓ По чистой дельте |Δ|'}
+                  {sortMode === 'alpha' && 'А–Я По алфавиту'}
+                </button>
+              </div>
+
+              <div className="text-xs text-slate-500">
+                Модулей: <b>{filteredBlocks.length}</b>
+              </div>
+            </div>
+
+            {filteredBlocks.map((block) => {
+              const isCollapsed = !!collapsedModules[block.name];
+              return (
+                <div key={block.name} className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+                  <div
+                    onClick={() => setCollapsedModules((p) => ({ ...p, [block.name]: !p[block.name] }))}
+                    className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center cursor-pointer hover:bg-slate-100 transition"
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-slate-400 font-bold">{isCollapsed ? '▶' : '▼'}</span>
+                      <span className="font-bold text-sm text-slate-800">{block.name}</span>
+                      <span className="text-xs text-slate-500">({block.rows.length} бакетов)</span>
+                    </div>
+                    <span className="text-xs font-semibold text-slate-600 bg-white border border-slate-200 px-2 py-0.5 rounded">
+                      Макс. сдвиг: до <b>{block.maxAffectedClients}</b> анкет
+                    </span>
+                  </div>
+
+                  {!isCollapsed && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs font-mono">
+                        <thead className="bg-white text-slate-500 border-b border-slate-100 font-sans font-semibold">
+                          <tr>
+                            <th className="py-2 px-4">Параметр (KEY)</th>
+                            <th className="py-2 px-4">Бакет (VALUE)</th>
+                            <th className="py-2 px-4 text-center">MASTER (Было)</th>
+                            <th className="py-2 px-4 text-center">DIFF=0</th>
+                            <th className="py-2 px-4 text-center text-rose-700">Ушло (-LEFT)</th>
+                            <th className="py-2 px-4 text-center text-emerald-700">Пришло (+ARRIVED)</th>
+                            <th className="py-2 px-4 text-center">BETA (Стало)</th>
+                            <th className="py-2 px-4 text-center">Дельта (Δ)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {block.rows.map((row) => (
+                            <tr key={row.id} className={row.totalChanges > 0 ? 'bg-amber-50/20' : 'hover:bg-slate-50'}>
+                              <td className="py-2 px-4 text-slate-700 font-medium">{row.arrayKey ? `${row.arrayKey}.${row.key}` : row.key}</td>
+                              <td className="py-2 px-4 font-bold text-slate-900">{row.value}</td>
+                              <td className="py-2 px-4 text-center font-bold text-slate-700">{row.masterTotal}</td>
+                              <td className="py-2 px-4 text-center text-slate-400">{row.stableCount}</td>
+                              <td className="py-2 px-4 text-center text-rose-600 font-bold">
+                                {row.leftCount > 0 ? `-${row.leftCount}` : '0'}
+                              </td>
+                              <td className="py-2 px-4 text-center text-emerald-600 font-bold">
+                                {row.arrivedCount > 0 ? `+${row.arrivedCount}` : '0'}
+                              </td>
+                              <td className="py-2 px-4 text-center font-bold text-slate-900">{row.betaTotal}</td>
+                              <td className="py-2 px-4 text-center font-bold">
+                                {row.netDelta > 0 ? `+${row.netDelta}` : row.netDelta}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </main>
+      )}
+
+      {/* ==========================================
+          ВКЛАДКА 2: РЕЕСТР АНКЕТ
+      ========================================== */}
+      {activeTab === 'registry' && (
+        <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-4">
+          <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm space-y-4">
+            <div className="flex flex-wrap justify-between items-center gap-3 border-b border-slate-100 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-slate-800">Реестр кредитных заявок (Прогон #{runId})</h3>
+                <p className="text-xs text-slate-500">
+                  Показано: <b>{filteredApps.length} из {applications.length}</b> анкет из базы FastAPI
+                </p>
+              </div>
+
+              {selectedPivotFilter && (
+                <button
+                  onClick={() => setSelectedPivotFilter(null)}
+                  className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 rounded-lg border border-blue-200 cursor-pointer"
+                >
+                  ✕ Сбросить срез: {selectedPivotFilter.value} ({selectedPivotFilter.direction})
+                </button>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-3 rounded-lg">
+              <input
+                type="text"
+                placeholder="Поиск по ID заявки (например: I32554354)..."
+                value={registrySearch}
+                onChange={(e) => setRegistrySearch(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && registrySearch.trim() && handleOpenDossier(registrySearch)}
+                className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none w-72 focus:border-blue-500 font-mono"
+              />
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={() => setRegistryStatusFilter('ALL')}
+                  className={`px-3 py-1 rounded-lg text-xs font-semibold border transition cursor-pointer ${
+                    registryStatusFilter === 'ALL'
+                      ? 'bg-blue-600 text-white border-blue-600'
+                      : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                  }`}
+                >
+                  Все ({applications.length})
+                </button>
+                {uniqueDecisions.map((dec) => (
+                  <button
+                    key={dec}
+                    onClick={() => setRegistryStatusFilter(dec)}
+                    className={`px-3 py-1 rounded-lg text-xs font-semibold border transition cursor-pointer ${
+                      registryStatusFilter === dec
+                        ? 'bg-blue-600 text-white border-blue-600'
+                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                    }`}
+                  >
+                    {dec}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto border border-slate-200 rounded-lg">
+              <table className="w-full text-left text-xs font-mono">
+                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
+                  <tr>
+                    <th className="py-2.5 px-4">ID Заявки</th>
+                    <th className="py-2.5 px-4">MASTER (Было)</th>
+                    <th className="py-2.5 px-4">BETA (Стало)</th>
+                    <th className="py-2.5 px-4 text-center">Расхождений (DIFF)</th>
+                    <th className="py-2.5 px-4 text-right font-sans">Действие</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredApps.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="py-8 text-center text-slate-400 font-sans">
+                        Заявок по заданному критерию не обнаружено
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredApps.map((app, idx) => {
+                      const appId = String(app.app_id || app.id || '');
+                      const decBefore = app.beforeDecision || '—';
+                      const decAfter = app.afterDecision || app.decision_after || '—';
+                      const diffCnt = Number(app.diffCount ?? app.diff_count ?? 0);
+
+                      return (
+                        <tr
+                          key={idx}
+                          onClick={() => handleOpenDossier(appId)}
+                          className="hover:bg-blue-50/40 cursor-pointer transition"
+                        >
+                          <td className="py-3 px-4 font-bold text-slate-900">{appId}</td>
+                          <td className="py-3 px-4">{decBefore}</td>
+                          <td className="py-3 px-4 font-bold text-slate-900">
+                            <span className="px-2 py-0.5 rounded text-[11px] bg-slate-100 border border-slate-200">
+                              {decAfter}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-center text-amber-700 font-bold">{diffCnt} шт.</td>
+                          <td className="py-3 px-4 text-right font-sans">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleOpenDossier(appId);
+                              }}
+                              className="bg-slate-900 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs font-semibold transition cursor-pointer"
+                            >
+                              Открыть досье →
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </main>
+      )}
+
+      {/* ==========================================
+          ВКЛАДКА 3: ЗАПУСК И ПАЙПЛАЙН
+      ========================================== */}
+      {activeTab === 'run' && (
+        <main className="flex-1 p-6 max-w-5xl w-full mx-auto space-y-6">
+          <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
+            <h3 className="text-sm font-bold text-slate-800">Запуск нового бэктеста</h3>
+            <p className="text-xs text-slate-500">
+              Пользователь: <b>{currentUser.name} (ID: {currentUser.id})</b>
+            </p>
+
+            <button
+              onClick={async () => {
+                setIsPipelineRunning(true);
+                setPipelineSeconds(0);
+                if (timerRef.current) clearInterval(timerRef.current);
+                timerRef.current = setInterval(() => setPipelineSeconds((s) => s + 1), 1000);
+
+                try {
+                  const res = await fetch(getApiUrl('/api/runs/'), {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: currentUser.id })
+                  });
+                  if (res.ok) {
+                    const data = await res.json();
+                    const newId = String(data.id || data.run_id);
+                    setRunId(newId);
+                    await fetchRunsList();
+                    await fetchReportData(newId);
+                  }
+                } catch {}
+
+                setTimeout(() => {
+                  clearInterval(timerRef.current);
+                  setIsPipelineRunning(false);
+                  setActiveTab('matrix');
+                }, 1500);
+              }}
+              disabled={isPipelineRunning}
+              className="w-full py-2.5 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm cursor-pointer disabled:opacity-50"
+            >
+              {isPipelineRunning ? `Выполняется расчет (${pipelineSeconds} с)...` : '▶ Запустить новый прогон пайплайна'}
+            </button>
+          </div>
+
+          <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-3">
+            <h3 className="text-sm font-bold text-slate-800">Журнал этапов пайплайна</h3>
+            {(pipelineSteps.length > 0 ? pipelineSteps : [
+              { name: '1. Загрузка JSON-файлов датасета', status: 'done', time: 'Готово' },
+              { name: '2. Динамическая нормализация (Generic Flattener)', status: 'done', time: 'Готово' },
+              { name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'done', time: 'Готово' },
+              { name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'done', time: 'Готово' }
+            ]).map((s, idx) => (
+              <div key={idx} className="flex justify-between items-center p-3 rounded-lg bg-slate-50 border border-slate-100 text-xs">
+                <span className="font-semibold text-slate-700">{s.name || `Этап ${idx + 1}`}</span>
+                <span className="text-[11px] font-mono text-slate-400">{s.time || s.status || 'OK'}</span>
+              </div>
+            ))}
+          </div>
+        </main>
+      )}
+
+      {/* ==========================================
+          ПОЛНОЕ И ЧЕСТНОЕ ДОСЬЕ ЗАЯВКИ
+      ========================================== */}
+      {activeDossierAppId && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-sm">
           <div className="bg-white w-full max-w-3xl h-full shadow-2xl flex flex-col p-6 overflow-hidden">
             <div className="flex justify-between items-start border-b border-slate-200 pb-4">
               <div>
                 <div className="flex items-center gap-2">
-                  <h3 className="font-bold text-lg text-slate-800">Досье заявки: {activeDossierApp}</h3>
+                  <h3 className="font-bold text-lg text-slate-800 font-mono">Досье анкеты: {activeDossierAppId}</h3>
                   <span className="text-xs bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded">
-                    Параметров: {dossierRows.length}
+                    Строк: {dossierRows.length}
                   </span>
                   {isDossierLoading && (
-                    <span className="text-xs text-blue-600 animate-pulse font-semibold">
-                      Запрос к FastAPI...
-                    </span>
+                    <span className="text-xs text-blue-600 animate-pulse font-semibold">Запрос к FastAPI...</span>
                   )}
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                  Сравнение параметров BEFORE (MASTER) и AFTER (BETA) из базы данных
+                  Данные из <code>/api/reports/{runId}/applications/{activeDossierAppId}/diff</code>
                 </p>
               </div>
               <button
-                onClick={() => setActiveDossierApp(null)}
-                className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 rounded-lg hover:bg-slate-100 cursor-pointer"
+                onClick={() => setActiveDossierAppId(null)}
+                className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto my-4">
-              <div className="border border-slate-200 rounded-xl overflow-hidden">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-100 text-slate-600 border-b border-slate-200">
+            <div className="flex-1 overflow-y-auto my-4 border border-slate-200 rounded-xl">
+              {dossierRows.length === 0 ? (
+                <div className="p-8 text-center text-slate-400 text-xs">
+                  Для анкеты {activeDossierAppId} нет зарегистрированных расхождений
+                </div>
+              ) : (
+                <table className="w-full text-left text-xs font-mono">
+                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
                     <tr>
-                      <th className="py-2 px-3 font-semibold">Модуль (CLASS / PREFIX)</th>
-                      <th className="py-2 px-3 font-semibold">Параметр (KEY)</th>
-                      <th className="py-2 px-3 font-semibold text-rose-700">VALUE_BEFORE</th>
-                      <th className="py-2 px-3 font-semibold text-emerald-700">VALUE_AFTER</th>
-                      <th className="py-2 px-3 font-semibold">Статус</th>
-                      <th className="py-2 px-3 font-semibold">Комментарий</th>
+                      <th className="py-2 px-3">Модуль (CLASS)</th>
+                      <th className="py-2 px-3">Параметр (KEY)</th>
+                      <th className="py-2 px-3 text-rose-700">VALUE_BEFORE</th>
+                      <th className="py-2 px-3 text-emerald-700">VALUE_AFTER</th>
+                      <th className="py-2 px-3 text-center">Статус</th>
+                      <th className="py-2 px-3">Комментарий</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-100 font-mono">
-                    {dossierRows.map((row, idx) => {
-                      const isDiff = Number(row.DIFF_FLAG ?? row.diff_flag) === 1;
-                      const mod = row.CLASS || row.PREFIX || '—';
-                      const key = row.ARRAY_KEY ? `${row.ARRAY_KEY}.${row.KEY}` : row.KEY || '(параметр)';
-                      const valBefore = row.VALUE_BEFORE ?? row.value_before ?? '—';
-                      const valAfter = row.VALUE_AFTER ?? row.value_after ?? '—';
-                      const adjBefore = row.ADJUSTED_BEFORE ?? row.adjusted_before ?? '';
-                      const adjAfter = row.ADJUSTED_AFTER ?? row.adjusted_after ?? '';
-                      const comment = row.COMMENT || row.comment || '—';
+                  <tbody className="divide-y divide-slate-100">
+                    {dossierRows.map((r, idx) => {
+                      const isDiff = Number(r.DIFF_FLAG ?? r.diff_flag) === 1;
+                      const comment = r.COMMENT || r.comment || '';
 
                       return (
                         <tr key={idx} className={isDiff ? 'bg-amber-50/50' : 'hover:bg-slate-50'}>
-                          <td className="py-2 px-3 font-sans text-slate-600">{mod}</td>
-                          <td className="py-2 px-3 font-bold text-slate-800">{key}</td>
-                          <td className="py-2 px-3 text-rose-600">
-                            <div>{valBefore}</div>
-                            {adjBefore && adjBefore !== valBefore && (
-                              <div className="text-[10px] text-slate-400">бакет: {adjBefore}</div>
-                            )}
-                          </td>
-                          <td className="py-2 px-3 text-emerald-600 font-bold">
-                            <div>{valAfter}</div>
-                            {adjAfter && adjAfter !== valAfter && (
-                              <div className="text-[10px] text-slate-400 font-normal">бакет: {adjAfter}</div>
-                            )}
-                          </td>
-                          <td className="py-2 px-3">
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-sans font-bold ${
-                              isDiff ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-400'
+                          <td className="py-2 px-3 font-sans text-slate-600">{r.CLASS || r.class_name || r.PREFIX || '—'}</td>
+                          <td className="py-2 px-3 font-bold text-slate-800">{r.ARRAY_KEY ? `${r.ARRAY_KEY}.${r.KEY || r.key}` : r.KEY || r.key}</td>
+                          <td className="py-2 px-3 text-rose-600">{String(r.VALUE_BEFORE ?? r.value_before ?? '—')}</td>
+                          <td className="py-2 px-3 text-emerald-600 font-bold">{String(r.VALUE_AFTER ?? r.value_after ?? '—')}</td>
+                          <td className="py-2 px-3 text-center font-sans">
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
+                              isDiff ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
                             }`}>
                               {isDiff ? 'DIFF=1' : 'MATCH'}
                             </span>
                           </td>
-                          <td className="py-2 px-3 font-sans text-slate-600 text-[11px]">{comment}</td>
+                          <td className="py-2 px-3 font-sans text-slate-500 text-[11px]">{comment}</td>
                         </tr>
                       );
                     })}
                   </tbody>
                 </table>
-              </div>
+              )}
             </div>
 
             <div className="border-t border-slate-200 pt-3 flex justify-end">
               <button
-                onClick={() => setActiveDossierApp(null)}
-                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold transition cursor-pointer"
+                onClick={() => setActiveDossierAppId(null)}
+                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer"
               >
                 Закрыть досье
               </button>
@@ -1917,163 +1375,102 @@ export default function App() {
         </div>
       )}
 
-      {/* ── МОДАЛЬНОЕ ОКНО CODEMIRROR ── */}
-      {codeEditorModal.isOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
-          <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl w-full max-w-3xl overflow-hidden flex flex-col text-white">
-            <div className="px-5 py-3.5 border-b border-slate-800 flex justify-between items-center">
+      {/* ==========================================
+          МОДАЛЬНОЕ ОКНО ДОБАВЛЕНИЯ АНАЛИТИКА
+      ========================================== */}
+      {isAddUserModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <form
+            onSubmit={handleCreateAnalyst}
+            className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200"
+          >
+            <h3 className="font-bold text-sm text-slate-800">Создать профиль аналитика</h3>
+            
+            <div className="text-xs space-y-3">
               <div>
-                <span className="text-[10px] font-mono uppercase tracking-wider text-blue-400 font-bold">Python Code Viewer</span>
-                <h3 className="font-bold text-sm text-slate-100">{codeEditorModal.title}</h3>
-              </div>
-              <button
-                onClick={() => setCodeEditorModal({ ...codeEditorModal, isOpen: false })}
-                className="text-slate-400 hover:text-white p-1 rounded-lg"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="p-3 bg-slate-950 font-mono text-xs">
-              <CodeMirror
-                value={codeEditorModal.code}
-                height="320px"
-                theme="dark"
-                extensions={[python()]}
-                readOnly={codeEditorModal.readOnly}
-                onChange={(val) => {
-                  if (!codeEditorModal.readOnly) {
-                    setCodeEditorModal((prev) => ({ ...prev, code: val }));
-                  }
-                }}
-              />
-            </div>
-
-            <div className="px-5 py-3 border-t border-slate-800 flex justify-between items-center bg-slate-900/80">
-              <span className="text-[11px] text-slate-400">
-                {codeEditorModal.readOnly ? 'Режим только для чтения' : 'Редактирование активно'}
-              </span>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => setCodeEditorModal({ ...codeEditorModal, isOpen: false })}
-                  className="px-3 py-1.5 text-xs text-slate-300 hover:text-white transition cursor-pointer"
-                >
-                  Закрыть
-                </button>
-                {!codeEditorModal.readOnly && (
-                  <button
-                    onClick={() => {
-                      if (codeEditorModal.onSave) codeEditorModal.onSave(codeEditorModal.code);
-                      setCodeEditorModal({ ...codeEditorModal, isOpen: false });
-                    }}
-                    className="px-4 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition cursor-pointer"
-                  >
-                    Сохранить изменения
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* ── МОДАЛЬНОЕ ОКНО СОЗДАНИЯ АВТОПРОВЕРКИ ── */}
-      {isCheckModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4 backdrop-blur-xs">
-          <form onSubmit={handleAddCustomCheck} className="bg-white rounded-2xl p-6 w-full max-w-lg space-y-4 shadow-xl border border-slate-200">
-            <h3 className="font-bold text-sm text-slate-800">Новая автопроверка риск-политики</h3>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] text-slate-500 mb-1">Название правила</label>
+                <label className="block text-slate-500 mb-1">ФИО / Отображаемое имя</label>
                 <input
                   type="text"
                   required
-                  placeholder="Контроль обнуления лимита при APPROVE"
-                  value={newCheckName}
-                  onChange={(e) => setNewCheckName(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs"
+                  placeholder="например: Аналитик 3 (Ольга)"
+                  value={newUserName}
+                  onChange={(e) => setNewUserName(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 outline-none focus:border-blue-500"
                 />
               </div>
-              <div>
-                <label className="block text-[11px] text-slate-500 mb-1">Модуль (CLASS)</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="limitResult"
-                  value={newCheckClass}
-                  onChange={(e) => setNewCheckClass(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono"
-                />
-              </div>
-            </div>
 
-            <div className="grid grid-cols-2 gap-3">
               <div>
-                <label className="block text-[11px] text-slate-500 mb-1">Проверяемый параметр</label>
+                <label className="block text-slate-500 mb-1">Логин для API (username)</label>
                 <input
                   type="text"
-                  required
-                  placeholder="limit"
-                  value={newCheckArg}
-                  onChange={(e) => setNewCheckArg(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono"
+                  placeholder="olga"
+                  value={newUserUsername}
+                  onChange={(e) => setNewUserUsername(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 font-mono outline-none focus:border-blue-500"
                 />
               </div>
-              <div>
-                <label className="block text-[11px] text-slate-500 mb-1">Порог контроля</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="0 обнулений лимита"
-                  value={newCheckThreshold}
-                  onChange={(e) => setNewCheckThreshold(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 text-xs"
-                />
-              </div>
-            </div>
 
-            <div>
-              <label className="block text-[11px] text-slate-500 mb-1">Python-логика проверки (Live Code):</label>
-              <div className="rounded-lg overflow-hidden border border-slate-300 text-xs">
-                <CodeMirror
-                  value={newCheckCode}
-                  height="140px"
-                  theme="dark"
-                  extensions={[python()]}
-                  onChange={(val) => setNewCheckCode(val)}
+              <div>
+                <label className="block text-slate-500 mb-1">Должность / Роль</label>
+                <input
+                  type="text"
+                  placeholder="Risk Officer"
+                  value={newUserRole}
+                  onChange={(e) => setNewUserRole(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg p-2 outline-none focus:border-blue-500"
                 />
               </div>
             </div>
 
             <div className="flex justify-end gap-2 pt-2">
-              <button type="button" onClick={() => setIsCheckModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer">Отмена</button>
-              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-blue-600 text-white rounded-lg cursor-pointer">Добавить проверку</button>
+              <button
+                type="button"
+                onClick={() => setIsAddUserModalOpen(false)}
+                className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer"
+              >
+                Отмена
+              </button>
+              <button
+                type="submit"
+                className="px-4 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-blue-600 text-white rounded-lg transition cursor-pointer"
+              >
+                Создать профиль
+              </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* Модалка добавления профиля аналитика */}
-      {newUserModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <form onSubmit={handleCreateUser} className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200">
-            <h3 className="font-bold text-sm text-slate-800">Создать профиль аналитика</h3>
-            <input
-              type="text"
-              required
-              placeholder="например: Аналитик 3 (Олег)"
-              value={newUserName}
-              onChange={(e) => setNewUserName(e.target.value)}
-              className="w-full border border-slate-300 rounded-lg p-2 text-xs outline-none focus:border-blue-500"
-            />
-            <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setNewUserModalOpen(false)} className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer">Отмена</button>
-              <button type="submit" className="px-4 py-1.5 text-xs font-semibold bg-slate-900 text-white rounded-lg cursor-pointer">Создать профиль</button>
+      {/* ==========================================
+          ПРОСМОТР КОДА ПРОВЕРОК ИЗ РЕПОЗИТОРИЯ
+      ========================================== */}
+      {codeModal.isOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl w-full max-w-3xl overflow-hidden flex flex-col text-white">
+            <div className="px-5 py-3.5 border-b border-slate-800 flex justify-between items-center">
+              <h3 className="font-bold text-sm text-slate-100">{codeModal.title}</h3>
+              <button onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })} className="text-slate-400 hover:text-white">✕</button>
             </div>
-          </form>
+            <div className="p-3 bg-slate-950 font-mono text-xs">
+              <CodeMirror
+                value={codeModal.code}
+                height="320px"
+                theme="dark"
+                extensions={[python()]}
+                readOnly={true}
+              />
+            </div>
+            <div className="px-5 py-3 border-t border-slate-800 flex justify-end bg-slate-900/80">
+              <button
+                onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })}
+                className="px-4 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 rounded-lg cursor-pointer"
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
         </div>
       )}
-
     </div>
   );
 }
