@@ -66,6 +66,30 @@ def main():
     # Сохраняем результат
     df_result.to_csv(out_file, sep=";", index=False, encoding="utf-8-sig")
     print(f"Готово! Сохранено {len(df_result)} строк в {out_file}")
+    
+    # --- РАСЧЕТ БИЗНЕС-ВЕРДИКТА ---
+    total = len(df_segments)
+    app_b = int((df_segments["DECISION_BEFORE"] == "APPROVE").sum())
+    app_a = int((df_segments["DECISION_AFTER"] == "APPROVE").sum())
+    new_app = int(len(df_segments[(df_segments["DECISION_BEFORE"] != "APPROVE") & (df_segments["DECISION_AFTER"] == "APPROVE")]))
+    lost_app = int(len(df_segments[(df_segments["DECISION_BEFORE"] == "APPROVE") & (df_segments["DECISION_AFTER"] != "APPROVE")]))
+    net_impact = new_app - lost_app
+
+    verdict_data = {
+        "total_apps": total,
+        "ar_before": round(app_b / total * 100, 2) if total else 0.0,
+        "ar_after": round(app_a / total * 100, 2) if total else 0.0,
+        "new_approved": new_app,
+        "lost_approved": lost_app,
+        "net_impact": net_impact,
+        "summary": "Ужесточение стратегии" if net_impact < 0 else "Экспансия портфеля"
+    }
+
+    verdict_file = os.path.join(out_dir, "verdict.json")
+    with open(verdict_file, "w", encoding="utf-8") as f:
+        json.dump(verdict_data, f, ensure_ascii=False, indent=2)
+
+    print(f"Бизнес-вердикт сохранен в {verdict_file}")
 
 if __name__ == "__main__":
     main()
