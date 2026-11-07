@@ -1,103 +1,100 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 import { python } from '@codemirror/lang-python';
-
-// Безопасный импорт локальных данных проекта (для работы в режиме оффлайн/демо)
-let fallbackPivotFacts = [];
-let fallbackComparisonCsv = '';
-try {
-  fallbackPivotFacts = (await import('./data/08_pivot_facts_demo.json')).default;
-  fallbackComparisonCsv = (await import('./data/06_comparison_app1001.csv?raw')).default;
-} catch (e) {
-  console.warn('Локальные файлы мок-данных не обнаружены, система работает напрямую с FastAPI.', e);
-}
+import { REPO_PYTHON_SCRIPTS } from './checkScripts.js';
 
 // ----------------------------------------------------
-// 1. ИСХОДНЫЙ КОД 5 ПРОВЕРОК ИЗ РЕПОЗИТОРИЯ (ДЛЯ ПРОСМОТРА)
+// Локальные данные для fallback-режима.
+// import.meta.glob не падает на сборке, если файлов нет: просто вернёт пустой объект.
 // ----------------------------------------------------
-const REPO_PYTHON_SCRIPTS = {
-  ar_drop_by_product: `# -*- coding: utf-8 -*-
-"""Approval Rate по продукту: FAIL, если относительное падение больше порога."""
-DEFAULTS = {"max_drop_rel": 0.10, "low_confidence_cnt": 5, "app_ids_limit": 20}
+const pivotGlob = import.meta.glob('./data/08_pivot_facts_demo.json', { eager: true, import: 'default' });
+const csvGlob = import.meta.glob('./data/06_comparison_app1001.csv', { eager: true, query: '?raw', import: 'default' });
+const fallbackPivotFacts = Object.values(pivotGlob)[0] ?? [];
+const fallbackComparisonCsv = Object.values(csvGlob)[0] ?? '';
 
-def run(mart, params=None):
-    p = {**DEFAULTS, **(params or {})}
-    by_product = {}
-    for s in mart.segments():
-        for product in (s.get("PRODUCTS") or "").split(";"):
-            if not product:
-                continue
-            d = by_product.setdefault(product, {"total": 0, "ap_b": 0, "ap_a": 0, "lost": []})
-            d["total"] += 1
-            if s.get("DECISION_BEFORE") == "APPROVE":
-                d["ap_b"] += 1
-            if s.get("DECISION_AFTER") == "APPROVE":
-                d["ap_a"] += 1
-            if s.get("DECISION_BEFORE") == "APPROVE" and s.get("DECISION_AFTER") != "APPROVE":
-                d["lost"].append(s["APP_ID"])
-    # Расчет drop_rel и возврат строк...
-`,
-  attribute_new_loss: `# -*- coding: utf-8 -*-
-"""Изменился состав атрибутов ответа: появились новые или пропали существующие."""
-DEFAULTS = {"min_share": 0.001, "low_confidence_cnt": 5, "app_ids_limit": 20}
-
-def run(mart, params=None):
-    p = {**DEFAULTS, **(params or {})}
-    total = mart.total_apps()
-    agg = {}
-    for change in ("ATTRIBUTE_NEW", "ATTRIBUTE_LOST"):
-        for r in mart.rows(change_type=change):
-            agg.setdefault((change, r["PATH"]), set()).add(r["APP_ID"])
-`,
-  external_score_drift: `# -*- coding: utf-8 -*-
-"""Различие вызвано входными данными, а не стратегией."""
-SCORE_PATH = "characteristics.score_okb"
-FEATURE_PATH = "decisionResult.scoring.features.score_okb"
-DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
-
-def run(mart, params=None):
-    p = {**DEFAULTS, **(params or {})}
-    total = mart.total_apps()
-    drifted = {r["APP_ID"] for r in mart.rows(path=SCORE_PATH, diff_flag=1)}
-    decision_changed = {s["APP_ID"] for s in mart.segments() if s.get("DECISION_CHANGED")}
-    false_alarm = drifted & decision_changed
-`,
-  stop_factor_disappeared: `# -*- coding: utf-8 -*-
-"""Стоп-фактор перестал работать: правило пропало из ответа либо hit true -> false."""
-RULE_HIT_PATH = "decisionResult.product_trials.rules.hit"
-DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
-
-def run(mart, params=None):
-    p = {**DEFAULTS, **(params or {})}
-    lost, turned_off = {}, {}
-    for r in mart.rows(path=RULE_HIT_PATH, change_type="ATTRIBUTE_LOST"):
-        if r.get("VALUE_BEFORE") == "true":
-            lost.setdefault(r["ARRAY_KEY"], set()).add(r["APP_ID"])
-`,
-  target_model_changed: `# -*- coding: utf-8 -*-
-"""Сменилась целевая модель, по которой принимается решение по продукту."""
-DEFAULTS = {"low_confidence_cnt": 5, "app_ids_limit": 20}
-
-def run(mart, params=None):
-    p = {**DEFAULTS, **(params or {})}
-    total = mart.total_apps()
-    pairs = {}
-    for s in mart.segments():
-        mb, ma = s.get("PD_MODEL_BEFORE"), s.get("PD_MODEL_AFTER")
-        if mb != ma:
-            pairs.setdefault(f"{mb} -> {ma}", set()).add(s["APP_ID"])
-`
+// ----------------------------------------------------
+// Конфигурация (единственное место с "знанием" о данных)
+// ----------------------------------------------------
+const DECISION_KEY = 'decision'; // KEY строки итогового решения (без ARRAY_KEY)
+// Порядок строгости исходов: чем правее, тем жёстче. Неизвестные исходы нейтральны.
+const SEVERITY = ['APPROVE', 'VERIFICATION', 'REFER', 'REJECT', 'DECLINE'];
+const NO_VALUE = '—';
+const ROWS_PER_MODULE = 50;
+const APPS_PAGE = 100;
+const HIGH_CARDINALITY = 300;
+const POLL_MS = 2000;
+const POLL_MAX = 300; // 10 минут
+const TERMINAL_OK = ['completed', 'done', 'finished', 'success'];
+const TERMINAL_FAIL = ['failed', 'error', 'cancelled'];
+const STEP_LABELS = {
+  load: 'Загрузка JSON-файлов датасета',
+  normalize: 'Нормализация и расчёт различий (DuckDB)',
+  checks: 'Исполнение проверок (Quality Gates)'
 };
 
+const LABEL_TO_CHECK_ID = Object.fromEntries(
+  Object.entries(REPO_PYTHON_SCRIPTS).map(([id, code]) => [(code.match(/"label":\s*"([^"]+)"/) || [])[1], id])
+);
+
+const INITIAL_ANALYSTS = [
+  { id: '1', name: 'Аналитик 1 (Иван Семенов)', username: 'ivan', role: 'Lead Risk Modeler' },
+  { id: '2', name: 'Аналитик 2 (Мария Васильева)', username: 'maria', role: 'Senior Strategy Validator' }
+];
+
 // ----------------------------------------------------
-// 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// Утилиты
 // ----------------------------------------------------
+const api = (path) => {
+  let base = '';
+  try {
+    base = (localStorage.getItem('spr_backend_url') || '').trim().replace(/\/+$/, '');
+  } catch {
+    /* localStorage недоступен */
+  }
+  return base ? `${base}${path}` : path;
+};
+
+const getJson = async (path, signal) => {
+  const res = await fetch(api(path), { signal });
+  if (!res.ok) throw new Error(`${path}: HTTP ${res.status}`);
+  return res.json();
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const isEmpty = (v) => v === null || v === undefined || v === '';
+const normId = (x) => String(x ?? '').trim().replace(/^APP-/, '');
+const fmtPct = (x) => (Number.isFinite(Number(x)) && x !== null ? `${(Number(x) * 100).toFixed(1)}%` : '—');
+const escapeHtml = (s) =>
+  String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+const resolveModuleName = (row) => [row.PREFIX, row.CLASS].filter((x) => !isEmpty(x)).join(' › ') || 'Общие параметры';
+const paramPath = (r) => [r.ARRAY_KEY ?? r.arrayKey, r.KEY ?? r.key].filter((x) => !isEmpty(x)).join('.');
+
+const severityRank = (d) => {
+  const i = SEVERITY.indexOf(String(d).toUpperCase());
+  return i === -1 ? null : i;
+};
+const sortDecisions = (a, b) => {
+  const ra = severityRank(a);
+  const rb = severityRank(b);
+  if (ra !== null && rb !== null) return ra - rb;
+  if (ra !== null) return -1;
+  if (rb !== null) return 1;
+  return String(a).localeCompare(String(b));
+};
+const decisionClass = (d) => {
+  const v = String(d).toUpperCase();
+  if (v === '—') return 'bg-slate-100 text-slate-400';
+  if (v === 'APPROVE') return 'bg-emerald-100 text-emerald-800 border border-emerald-200';
+  if (v === 'REJECT' || v === 'DECLINE') return 'bg-rose-100 text-rose-800 border border-rose-200';
+  return 'bg-amber-100 text-amber-800 border border-amber-200';
+};
+
 function parseSemicolonCsv(text) {
   if (!text || typeof text !== 'string') return [];
   const lines = text.trim().split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (lines.length < 2) return [];
-
-  const headers = lines[0].replace(/^\ufeff/, '').split(';').map((h) => h.trim());
+  const headers = lines[0].replace(/^﻿/, '').split(';').map((h) => h.trim());
   return lines.slice(1).map((line) => {
     const values = line.split(';').map((v) => v.trim());
     const row = {};
@@ -108,31 +105,68 @@ function parseSemicolonCsv(text) {
   });
 }
 
-const resolveModuleName = (row) => {
-  const raw = row.CLASS || row.class_name || row.PREFIX || row.prefix || 'Общие параметры';
-  return String(raw).trim() || 'Общие параметры';
+// Реестр заявок для fallback-режима из демо-CSV
+function buildAppsFromCsv(text) {
+  const map = {};
+  parseSemicolonCsv(text).forEach((r) => {
+    const id = normId(r.APP_ID);
+    if (!id) return;
+    const a = (map[id] = map[id] || { app_id: id, id: `APP-${id}`, beforeDecision: null, afterDecision: null, diffCount: 0 });
+    if (Number(r.DIFF_FLAG) === 1) a.diffCount += 1;
+    if (r.KEY === DECISION_KEY && isEmpty(r.ARRAY_KEY)) {
+      a.beforeDecision = r.ADJUSTED_BEFORE || r.VALUE_BEFORE || null;
+      a.afterDecision = r.ADJUSTED_AFTER || r.VALUE_AFTER || null;
+    }
+  });
+  return Object.values(map);
+}
+
+const parseIds = (v) => {
+  if (Array.isArray(v)) return v.map(String);
+  if (typeof v === 'string' && v.trim()) {
+    try {
+      const parsed = JSON.parse(v);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {
+      /* не JSON */
+    }
+    return v.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+  return [];
 };
 
-const INITIAL_ANALYSTS = [
-  { id: '1', name: 'Аналитик 1 (Иван Семенов)', username: 'ivan', role: 'Lead Risk Modeler' },
-  { id: '2', name: 'Аналитик 2 (Мария Васильева)', username: 'maria', role: 'Senior Strategy Validator' }
-];
+const normalizeCheck = (c) => {
+  const label = c.LABEL ?? c.label ?? '—';
+  return {
+    LABEL: label,
+    ARGUMENT: c.ARGUMENT ?? c.argument ?? '',
+    CNT: Number(c.CNT ?? c.cnt ?? 0),
+    TOTAL: Number(c.TOTAL ?? c.total ?? 0),
+    METRIC: c.METRIC ?? c.metric ?? null,
+    RESULT: String(c.RESULT ?? c.result ?? '').toUpperCase(),
+    CONFIDENCE: c.CONFIDENCE ?? c.confidence ?? null,
+    APP_IDS: parseIds(c.APP_IDS ?? c.app_ids),
+    CHECK_ID: c.CHECK_ID ?? c.check_id ?? LABEL_TO_CHECK_ID[label] ?? null,
+    ESTIMATE: false
+  };
+};
+
+// Значение ячейки: пустое показываем как «нет» (атрибут отсутствовал до/после)
+const Cell = ({ v }) =>
+  isEmpty(v) ? <span className="text-slate-300 italic font-sans">нет</span> : <span>{String(v)}</span>;
 
 export default function App() {
-  // ----------------------------------------------------
-  // СИСТЕМНОЕ СОСТОЯНИЕ
-  // ----------------------------------------------------
   const [activeTab, setActiveTab] = useState('matrix');
-  const [apiStatus, setApiStatus] = useState('checking'); // 'connected' | 'fallback'
-  const [backendUrl, setBackendUrl] = useState(() => localStorage.getItem('spr_backend_url') || '');
+  const [apiStatus, setApiStatus] = useState('checking'); // checking | connected | fallback
   const [runId, setRunId] = useState(null);
   const [availableRuns, setAvailableRuns] = useState([]);
   const [isLoadingApi, setIsLoadingApi] = useState(false);
+  const [loadError, setLoadError] = useState(null);
 
-  // Пользователи и аналитики
+  // Аналитики
   const [analysts, setAnalysts] = useState(() => {
     try {
-      const saved = localStorage.getItem('spr_analysts_list_v2');
+      const saved = localStorage.getItem('spr_analysts_list_v7');
       return saved ? JSON.parse(saved) : INITIAL_ANALYSTS;
     } catch {
       return INITIAL_ANALYSTS;
@@ -144,201 +178,302 @@ export default function App() {
   const [newUserRole, setNewUserRole] = useState('Риск-аналитик');
   const [newUserUsername, setNewUserUsername] = useState('');
 
-  // Сохранение списка аналитиков
   useEffect(() => {
     try {
-      localStorage.setItem('spr_analysts_list_v2', JSON.stringify(analysts));
-    } catch {}
+      localStorage.setItem('spr_analysts_list_v7', JSON.stringify(analysts));
+    } catch {
+      /* localStorage недоступен */
+    }
   }, [analysts]);
 
-  // Данные из FastAPI
+  // Данные прогона
   const [pivotFacts, setPivotFacts] = useState([]);
-  const [applications, setApplications] = useState([]);
-  const [checksResults, setChecksResults] = useState([]);
+  const [rawApplications, setRawApplications] = useState([]);
+  const [rawDbChecks, setRawDbChecks] = useState([]);
+  const [pipelineSteps, setPipelineSteps] = useState([]);
 
   // Пайплайн
-  const [pipelineSteps, setPipelineSteps] = useState([]);
   const [isPipelineRunning, setIsPipelineRunning] = useState(false);
   const [pipelineSeconds, setPipelineSeconds] = useState(0);
+  const [pipelineError, setPipelineError] = useState(null);
+  const [runTag, setRunTag] = useState('Сравнение MASTER vs BETA');
   const timerRef = useRef(null);
+  const aliveRef = useRef(true);
 
-  // Фильтрация и Drill-down
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      clearInterval(timerRef.current);
+    };
+  }, []);
+
+  // Фильтры витрины
   const [selectedPivotFilter, setSelectedPivotFilter] = useState(null);
-  const [waterfallTargetBucket, setWaterfallTargetBucket] = useState(null); // Исход для диаграммы Waterfall
+  const [activeInvestigateCheck, setActiveInvestigateCheck] = useState(null);
+  const [waterfallTargetBucket, setWaterfallTargetBucket] = useState(null);
   const [searchFilter, setSearchFilter] = useState('');
-  const [onlyDiffRows, setOnlyDiffRows] = useState(false);
+  const [onlyDiffRows, setOnlyDiffRows] = useState(true);
   const [significantOnly, setSignificantOnly] = useState(false);
-  const [sortMode, setSortMode] = useState('impact'); // 'impact' | 'delta' | 'alpha'
+  const [sortMode, setSortMode] = useState('impact');
+  const [expandedModules, setExpandedModules] = useState({});
+  const [rowLimits, setRowLimits] = useState({});
+
+  // Реестр
   const [registryStatusFilter, setRegistryStatusFilter] = useState('ALL');
   const [registrySearch, setRegistrySearch] = useState('');
-  const [collapsedModules, setCollapsedModules] = useState({});
+  const [registryLimit, setRegistryLimit] = useState(APPS_PAGE);
 
-  // Досье заявки
+  // Досье
   const [activeDossierAppId, setActiveDossierAppId] = useState(null);
   const [dossierRows, setDossierRows] = useState([]);
   const [isDossierLoading, setIsDossierLoading] = useState(false);
+  const [dossierError, setDossierError] = useState(null);
+  const [dossierOnlyDiff, setDossierOnlyDiff] = useState(true);
+  const [dossierSearch, setDossierSearch] = useState('');
+  const dossierReq = useRef(0);
 
-  // Модальные окна
   const [codeModal, setCodeModal] = useState({ isOpen: false, title: '', code: '' });
 
-  const getApiUrl = useCallback((path) => {
-    const cleanBase = backendUrl.trim().replace(/\/+$/, '');
-    return cleanBase ? `${cleanBase}${path}` : path;
-  }, [backendUrl]);
-
-  // Авторизация аналитика
-  const authenticateAnalyst = useCallback(async (analyst) => {
-    setCurrentUser(analyst);
-    try {
-      await fetch(getApiUrl('/api/auth/login'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ user_id: analyst.id, username: analyst.username })
-      });
-    } catch {}
-  }, [getApiUrl]);
+  // Esc закрывает модалки
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return;
+      setCodeModal((m) => (m.isOpen ? { isOpen: false, title: '', code: '' } : m));
+      setIsAddUserModalOpen(false);
+      setActiveDossierAppId(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
 
   // ----------------------------------------------------
-  // ЗАГРУЗКА СПИСКА ПРОГОНОВ (БЕЗ ХАРДКОДА ID)
+  // Загрузка данных
   // ----------------------------------------------------
   const fetchRunsList = useCallback(async () => {
     try {
-      const res = await fetch(getApiUrl('/api/runs/'));
+      const res = await fetch(api('/api/runs/'));
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data) && data.length > 0) {
-          setAvailableRuns(data);
-          setRunId((prev) => prev || String(data[data.length - 1].id || data[data.length - 1].run_id || 1));
+          const sorted = [...data].sort((a, b) => Number(b.id) - Number(a.id)); // новые первыми
+          setAvailableRuns(sorted);
+          setRunId((prev) => prev || String(sorted[0].id));
           setApiStatus('connected');
-          return;
+          return sorted;
         }
       }
     } catch {
-      console.warn('API /api/runs/ недоступен, включен режим фолбэка.');
+      /* бэкенд недоступен */
     }
     setApiStatus('fallback');
-    setRunId((prev) => prev || '1');
-  }, [getApiUrl]);
+    setRunId((prev) => prev || 'demo');
+    return [];
+  }, []);
 
-  // ----------------------------------------------------
-  // ЗАГРУЗКА ДАННЫХ ВЫБРАННОГО ПРОГОНА ИЗ FASTAPI
-  // ----------------------------------------------------
-  const fetchReportData = useCallback(async (targetRunId) => {
-    if (!targetRunId) return;
-    setIsLoadingApi(true);
+  const resetRunState = useCallback(() => {
+    setPivotFacts([]);
+    setRawApplications([]);
+    setRawDbChecks([]);
+    setPipelineSteps([]);
+    setActiveInvestigateCheck(null);
+    setSelectedPivotFilter(null);
+    setWaterfallTargetBucket(null);
+    setExpandedModules({});
+    setRowLimits({});
+    setRegistryLimit(APPS_PAGE);
+    setRegistryStatusFilter('ALL');
+    setLoadError(null);
+  }, []);
 
-    try {
-      // 1. Загрузка витрины фактов
-      const resFacts = await fetch(getApiUrl(`/api/reports/${targetRunId}/pivot-facts`));
-      if (resFacts.ok) {
-        const facts = await resFacts.json();
-        if (Array.isArray(facts)) setPivotFacts(facts);
-      } else if (fallbackPivotFacts?.length > 0) {
-        setPivotFacts(fallbackPivotFacts);
-      }
+  const loadDemo = useCallback(() => {
+    resetRunState();
+    setPivotFacts(Array.isArray(fallbackPivotFacts) ? fallbackPivotFacts : []);
+    setRawApplications(buildAppsFromCsv(fallbackComparisonCsv));
+  }, [resetRunState]);
 
-      // 2. Загрузка готовых проверок из базы (CheckResult)
-      const resChecks = await fetch(getApiUrl(`/api/reports/${targetRunId}/checks`));
-      if (resChecks.ok) {
-        const checks = await resChecks.json();
-        if (Array.isArray(checks)) setChecksResults(checks);
-      }
-
-      // 3. Загрузка реестра заявок
-      const resApps = await fetch(getApiUrl(`/api/reports/${targetRunId}/applications`));
-      if (resApps.ok) {
-        const apps = await resApps.json();
-        if (Array.isArray(apps)) setApplications(apps);
-      }
-
-      // 4. Загрузка этапов пайплайна
+  const loadReport = useCallback(
+    async (id, signal) => {
+      resetRunState();
+      setIsLoadingApi(true);
+      const optional = (p) =>
+        p.catch((e) => {
+          if (e.name === 'AbortError') throw e;
+          return [];
+        });
       try {
-        const resSteps = await fetch(getApiUrl(`/api/runs/${targetRunId}/steps`));
-        if (resSteps.ok) {
-          const steps = await resSteps.json();
-          if (Array.isArray(steps)) setPipelineSteps(steps);
-        }
-      } catch {}
+        const [facts, checks, apps, steps] = await Promise.all([
+          getJson(`/api/reports/${id}/pivot-facts`, signal),
+          optional(getJson(`/api/reports/${id}/checks`, signal)),
+          optional(getJson(`/api/reports/${id}/applications`, signal)),
+          optional(getJson(`/api/runs/${id}/steps`, signal))
+        ]);
+        if (signal.aborted) return;
+        setPivotFacts(Array.isArray(facts) ? facts : []);
+        setRawDbChecks(Array.isArray(checks) ? checks : []);
+        setRawApplications(Array.isArray(apps) ? apps : []);
+        setPipelineSteps(Array.isArray(steps) ? steps : []);
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        if (e instanceof TypeError) setApiStatus('fallback'); // сеть пропала
+        else setLoadError(e.message || String(e));
+      } finally {
+        if (!signal.aborted) setIsLoadingApi(false);
+      }
+    },
+    [resetRunState]
+  );
 
-      setApiStatus('connected');
+  const fetchSteps = useCallback(async (id) => {
+    try {
+      const res = await fetch(api(`/api/runs/${id}/steps`));
+      if (res.ok) {
+        const s = await res.json();
+        if (Array.isArray(s)) {
+          setPipelineSteps(s);
+          return s;
+        }
+      }
     } catch {
-      setApiStatus('fallback');
-      if (fallbackPivotFacts?.length > 0) setPivotFacts(fallbackPivotFacts);
-    } finally {
-      setIsLoadingApi(false);
+      /* пропускаем тик */
     }
-  }, [getApiUrl]);
+    return [];
+  }, []);
 
   useEffect(() => {
     fetchRunsList();
   }, [fetchRunsList]);
 
   useEffect(() => {
-    if (runId) {
-      fetchReportData(runId);
+    if (apiStatus === 'checking') return undefined;
+    if (apiStatus === 'fallback') {
+      loadDemo();
+      return undefined;
     }
-  }, [runId, fetchReportData]);
+    if (!runId) return undefined;
+    const ctrl = new AbortController();
+    loadReport(runId, ctrl.signal);
+    return () => ctrl.abort();
+  }, [apiStatus, runId, loadReport, loadDemo]);
 
   // ----------------------------------------------------
-  // ДОСЬЕ АНКЕТЫ (/api/reports/{run_id}/applications/{app_id}/diff)
+  // Аналитики и запуск прогона
   // ----------------------------------------------------
-  const handleOpenDossier = useCallback(async (rawAppId) => {
-    if (!rawAppId) return;
-    const cleanId = String(rawAppId).trim();
-    const targetQueryId = cleanId.replace(/^APP-/, '');
+  const loginAnalyst = useCallback(async (user) => {
+    if (user.backendId) return user;
+    const res = await fetch(api('/api/auth/login'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user.username })
+    });
+    if (!res.ok) throw new Error(`Вход аналитика «${user.username}»: HTTP ${res.status}`);
+    const data = await res.json();
+    const updated = { ...user, backendId: data.id };
+    setAnalysts((list) => list.map((a) => (a.id === user.id ? updated : a)));
+    setCurrentUser(updated);
+    return updated;
+  }, []);
 
-    setActiveDossierAppId(cleanId);
-    setIsDossierLoading(true);
-
-    try {
-      const res = await fetch(getApiUrl(`/api/reports/${runId}/applications/${encodeURIComponent(targetQueryId)}/diff`));
-      if (res.ok) {
-        const rows = await res.json();
-        if (Array.isArray(rows) && rows.length > 0) {
-          setDossierRows(rows);
-          setIsDossierLoading(false);
-          return;
+  const pollRun = useCallback(
+    async (id, initialStatus) => {
+      let status = String(initialStatus || '').toLowerCase();
+      for (let i = 0; i < POLL_MAX; i += 1) {
+        if (!aliveRef.current) return;
+        await fetchSteps(id);
+        if (TERMINAL_OK.includes(status) || TERMINAL_FAIL.includes(status)) break;
+        await sleep(POLL_MS);
+        try {
+          const res = await fetch(api('/api/runs/'));
+          if (res.ok) {
+            const list = await res.json();
+            const r = Array.isArray(list) ? list.find((x) => String(x.id) === id) : null;
+            if (r) status = String(r.status || '').toLowerCase();
+          }
+        } catch {
+          /* следующий тик */
         }
       }
-    } catch {}
+      if (TERMINAL_FAIL.includes(status)) throw new Error(`Прогон завершился со статусом «${status}»`);
+    },
+    [fetchSteps]
+  );
 
-    // Локальный фолбэк по CSV
-    if (fallbackComparisonCsv) {
-      const parsed = parseSemicolonCsv(fallbackComparisonCsv);
-      const matched = parsed.filter(
-        (r) => r.APP_ID === cleanId || r.APP_ID === targetQueryId || String(r.APP_ID).replace(/^APP-/, '') === targetQueryId
-      );
-      setDossierRows(matched);
-    } else {
-      setDossierRows([]);
+  const startRun = async () => {
+    if (isPipelineRunning) return;
+    setIsPipelineRunning(true);
+    setPipelineError(null);
+    setPipelineSeconds(0);
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => setPipelineSeconds((s) => s + 1), 1000);
+
+    try {
+      if (apiStatus !== 'connected') throw new Error('Бэкенд недоступен: запуск возможен только в режиме ONLINE.');
+      const user = await loginAnalyst(currentUser);
+      const baseConfig = availableRuns[0]?.config ?? {};
+      const res = await fetch(api('/api/runs/'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: user.backendId,
+          config: { ...baseConfig, runTag: runTag.trim() || baseConfig.runTag || 'run' }
+        })
+      });
+      if (!res.ok) throw new Error(`POST /api/runs/ → HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const run = await res.json();
+      const newId = String(run.id);
+      setRunId(newId);
+      await pollRun(newId, run.status);
+      if (!aliveRef.current) return;
+      await fetchRunsList();
+      await loadReport(newId, new AbortController().signal);
+      setActiveTab('matrix');
+    } catch (e) {
+      setPipelineError(String(e.message || e));
+    } finally {
+      clearInterval(timerRef.current);
+      setIsPipelineRunning(false);
     }
-    setIsDossierLoading(false);
-  }, [runId, getApiUrl]);
+  };
 
   // ----------------------------------------------------
-  // ДИНАМИЧЕСКАЯ АГРЕГАЦИЯ ВИТРИНЫ
+  // Заявки
   // ----------------------------------------------------
-  const { decisionRows, moduleBlocks, summaryMetrics, uniqueDecisions } = useMemo(() => {
+  const applications = useMemo(() => {
+    const clean = (v) => (v && String(v).toUpperCase() !== 'UNKNOWN' ? String(v).toUpperCase() : '—');
+    return rawApplications.map((app) => {
+      const rawId = normId(app.app_id ?? app.id);
+      return {
+        app_id: rawId,
+        id: `APP-${rawId}`,
+        beforeDecision: clean(app.beforeDecision ?? app.before_decision ?? app.decision_before),
+        afterDecision: clean(app.afterDecision ?? app.after_decision ?? app.decision_after),
+        diffCount: Number(app.diffCount ?? app.diff_count ?? 0)
+      };
+    });
+  }, [rawApplications]);
+
+  const hasDecisions = useMemo(
+    () => applications.some((a) => a.beforeDecision !== '—' || a.afterDecision !== '—'),
+    [applications]
+  );
+  const changedApps = useMemo(() => applications.filter((a) => a.diffCount > 0).length, [applications]);
+
+  // ----------------------------------------------------
+  // Агрегация витрины (честный баланс: Было − Ушло + Пришло = Стало)
+  // ----------------------------------------------------
+  const { decisionRows, moduleBlocks, summaryMetrics, calculatedRows } = useMemo(() => {
     const map = {};
 
     pivotFacts.forEach((row) => {
       const mod = resolveModuleName(row);
-      const arrKey = row.ARRAY_KEY ? String(row.ARRAY_KEY) : '';
-      const key = row.KEY ? String(row.KEY) : '';
-      const val = row.VALUE_ADJUSTED ?? row.VALUE_AFTER ?? row.VALUE_BEFORE ?? '—';
-      const rowId = `${mod}__${arrKey}__${key}__${val}`;
+      const arrKey = isEmpty(row.ARRAY_KEY) ? '' : String(row.ARRAY_KEY);
+      const key = isEmpty(row.KEY) ? '' : String(row.KEY);
+      const rawVal = [row.VALUE_ADJUSTED, row.VALUE_AFTER, row.VALUE_BEFORE].find((v) => !isEmpty(v));
+      const val = isEmpty(rawVal) ? NO_VALUE : String(rawVal);
+      const rowId = `${mod}\u0001${arrKey}\u0001${key}\u0001${val}`;
 
       if (!map[rowId]) {
-        map[rowId] = {
-          id: rowId,
-          module: mod,
-          arrayKey: arrKey,
-          key,
-          value: val,
-          stableCount: 0,
-          leftCount: 0,
-          arrivedCount: 0
-        };
+        map[rowId] = { id: rowId, module: mod, arrayKey: arrKey, key, value: val, stableCount: 0, leftCount: 0, arrivedCount: 0 };
       }
 
       const count = Number(row.CNT) || 0;
@@ -346,14 +481,15 @@ export default function App() {
       const isBefore = String(row.SOURCE || '').toUpperCase().includes('BEFORE');
 
       if (!isDiff) {
-        if (isBefore) map[rowId].stableCount += count;
+        if (isBefore) map[rowId].stableCount += count; // BEFORE и AFTER для DIFF=0 равны, считаем один раз
+      } else if (isBefore) {
+        map[rowId].leftCount += count;
       } else {
-        if (isBefore) map[rowId].leftCount += count;
-        else map[rowId].arrivedCount += count;
+        map[rowId].arrivedCount += count;
       }
     });
 
-    const calculatedRows = Object.values(map).map((r) => {
+    const calc = Object.values(map).map((r) => {
       const masterTotal = r.stableCount + r.leftCount;
       const betaTotal = r.stableCount + r.arrivedCount;
       const netDelta = betaTotal - masterTotal;
@@ -368,97 +504,142 @@ export default function App() {
       };
     });
 
-    // Определение модуля решений
-    const decRows = calculatedRows.filter(
-      (r) =>
-        r.key.toLowerCase().includes('decision') ||
-        r.module.toLowerCase().includes('decision') ||
-        r.module.toLowerCase() === 'decisionresult'
-    );
-    const primaryDecModule = decRows[0]?.module || calculatedRows[0]?.module || 'decisionResult';
-    const primaryDecRows = calculatedRows.filter((r) => r.module === primaryDecModule);
-
-    // Уникальные исходы
-    const decValuesSet = new Set();
-    primaryDecRows.forEach((r) => decValuesSet.add(r.value));
-    applications.forEach((a) => {
-      if (a.afterDecision && a.afterDecision !== 'UNKNOWN') decValuesSet.add(a.afterDecision);
-      if (a.decision_after && a.decision_after !== 'UNKNOWN') decValuesSet.add(a.decision_after);
+    // Итоговое решение: строки с KEY=decision без ARRAY_KEY. Если таких модулей несколько, берём самый "массовый".
+    const candidates = calc.filter((r) => r.key.toLowerCase() === DECISION_KEY && !r.arrayKey);
+    const byModule = {};
+    candidates.forEach((r) => {
+      byModule[r.module] = (byModule[r.module] || 0) + r.masterTotal;
     });
+    const primaryDecModule = Object.keys(byModule).sort((a, b) => byModule[b] - byModule[a])[0];
+    const primaryDecRows = candidates.filter((r) => r.module === primaryDecModule).sort((a, b) => sortDecisions(a.value, b.value));
 
-    const totalPortfolio = primaryDecRows.reduce((sum, r) => sum + r.masterTotal, 0) || applications.length || 1;
-    const totalFlips = primaryDecRows.reduce((sum, r) => sum + r.leftCount, 0);
+    const totalPortfolio = primaryDecRows.reduce((s, r) => s + r.masterTotal, 0);
+    const totalFlips = primaryDecRows.reduce((s, r) => s + r.leftCount, 0);
 
-    // Группировка блоков
     const groups = {};
-    calculatedRows.forEach((r) => {
+    calc.forEach((r) => {
       if (!groups[r.module]) {
-        groups[r.module] = {
-          name: r.module,
-          rows: [],
-          totalDiffChanges: 0,
-          maxAffectedClients: 0,
-          maxAbsDelta: 0
-        };
+        groups[r.module] = { name: r.module, rows: [], totalDiffChanges: 0, maxAffectedClients: 0, maxAbsDelta: 0 };
       }
-      groups[r.module].rows.push(r);
-      groups[r.module].totalDiffChanges += r.totalChanges;
-      if (r.maxAffectedClients > groups[r.module].maxAffectedClients) {
-        groups[r.module].maxAffectedClients = r.maxAffectedClients;
-      }
-      if (r.absDelta > groups[r.module].maxAbsDelta) {
-        groups[r.module].maxAbsDelta = r.absDelta;
-      }
+      const g = groups[r.module];
+      g.rows.push(r);
+      g.totalDiffChanges += r.totalChanges;
+      g.maxAffectedClients = Math.max(g.maxAffectedClients, r.maxAffectedClients);
+      g.maxAbsDelta = Math.max(g.maxAbsDelta, r.absDelta);
     });
 
     return {
+      calculatedRows: calc,
       decisionRows: primaryDecRows,
       moduleBlocks: Object.values(groups),
-      uniqueDecisions: Array.from(decValuesSet),
       summaryMetrics: {
         totalPortfolio,
         totalFlips,
-        flipsPct: ((totalFlips / totalPortfolio) * 100).toFixed(1)
+        flipsPct: totalPortfolio > 0 ? ((totalFlips / totalPortfolio) * 100).toFixed(1) : '0.0'
       }
     };
-  }, [pivotFacts, applications]);
+  }, [pivotFacts]);
 
-  // Строка, выбранная для отображения в Waterfall
+  const portfolioSize = summaryMetrics.totalPortfolio || applications.length;
+
+  const uniqueDecisions = useMemo(() => {
+    const set = new Set();
+    applications.forEach((a) => {
+      if (a.afterDecision !== '—') set.add(a.afterDecision);
+      if (a.beforeDecision !== '—') set.add(a.beforeDecision);
+    });
+    decisionRows.forEach((r) => {
+      if (r.value !== NO_VALUE) set.add(r.value);
+    });
+    return Array.from(set).sort(sortDecisions);
+  }, [applications, decisionRows]);
+
+  // ----------------------------------------------------
+  // Проверки: данные бэка, а при их отсутствии честные оценки по витрине
+  // ----------------------------------------------------
+  const estimatedChecks = useMemo(() => {
+    const total = portfolioSize || 1;
+    const out = [];
+
+    const approveRow = decisionRows.find((r) => r.value.toUpperCase() === 'APPROVE');
+    if (approveRow && approveRow.masterTotal > 0) {
+      const rel = (approveRow.masterTotal - approveRow.betaTotal) / approveRow.masterTotal;
+      out.push({
+        LABEL: 'Approval Rate упал',
+        ARGUMENT: `APPROVE: ${approveRow.masterTotal} → ${approveRow.betaTotal}`,
+        CNT: approveRow.leftCount,
+        TOTAL: total,
+        METRIC: Number(rel.toFixed(4)),
+        RESULT: rel > 0.1 ? 'FAIL' : 'PASS',
+        CONFIDENCE: null,
+        APP_IDS: [],
+        CHECK_ID: 'ar_drop_by_product',
+        ESTIMATE: true
+      });
+    }
+
+    const lost = {};
+    calculatedRows.forEach((r) => {
+      if (r.key.toLowerCase() !== 'hit' || r.leftCount <= 0) return;
+      if (String(r.value).toLowerCase() !== 'true') return;
+      const rule = r.arrayKey.split('|').pop() || r.arrayKey;
+      lost[rule] = Math.max(lost[rule] || 0, r.leftCount); // по продуктам заявки пересекаются, суммировать нельзя
+    });
+    Object.entries(lost)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .forEach(([rule, cnt]) => {
+        out.push({
+          LABEL: 'Стоп-фактор перестал срабатывать',
+          ARGUMENT: `${rule} (макс. по продукту)`,
+          CNT: cnt,
+          TOTAL: total,
+          METRIC: Number((cnt / total).toFixed(4)),
+          RESULT: 'FAIL',
+          CONFIDENCE: cnt < 5 ? 'LOW' : 'HIGH',
+          APP_IDS: [],
+          CHECK_ID: 'stop_factor_disappeared',
+          ESTIMATE: true
+        });
+      });
+
+    return out;
+  }, [decisionRows, calculatedRows, portfolioSize]);
+
+  const checksResults = useMemo(
+    () => (rawDbChecks.length > 0 ? rawDbChecks.map(normalizeCheck) : estimatedChecks),
+    [rawDbChecks, estimatedChecks]
+  );
+  const checksAreEstimates = rawDbChecks.length === 0;
+
+  // Waterfall
   const activeWaterfallRow = useMemo(() => {
     if (decisionRows.length === 0) return null;
-    if (waterfallTargetBucket) {
-      return decisionRows.find((r) => r.value === waterfallTargetBucket) || decisionRows[0];
-    }
-    return decisionRows[0];
+    return decisionRows.find((r) => r.value === (waterfallTargetBucket || decisionRows[0].value)) || decisionRows[0];
   }, [decisionRows, waterfallTargetBucket]);
 
   // ----------------------------------------------------
-  // ФИЛЬТРАЦИЯ БЛОКОВ ВИТРИНЫ
+  // Фильтрация витрины модулей
   // ----------------------------------------------------
   const filteredBlocks = useMemo(() => {
     const q = searchFilter.toLowerCase().trim();
 
-    let list = moduleBlocks
+    const list = moduleBlocks
       .map((block) => {
-        let rows = block.rows.filter((r) => {
+        const rows = block.rows.filter((r) => {
           if (onlyDiffRows && r.totalChanges === 0) return false;
           if (significantOnly && r.maxAffectedClients < 10) return false;
           if (q) {
-            const match =
-              r.module.toLowerCase().includes(q) ||
-              r.key.toLowerCase().includes(q) ||
-              String(r.value).toLowerCase().includes(q);
-            if (!match) return false;
+            const hay = `${r.module} ${r.arrayKey} ${r.key} ${r.value}`.toLowerCase();
+            if (!hay.includes(q)) return false;
           }
           return true;
         });
-
         rows.sort((a, b) => {
           if (sortMode === 'impact') return b.maxAffectedClients - a.maxAffectedClients || b.totalChanges - a.totalChanges;
           if (sortMode === 'delta') return b.absDelta - a.absDelta;
-          return a.key.localeCompare(b.key);
+          return paramPath(a).localeCompare(paramPath(b));
         });
-
         return { ...block, rows };
       })
       .filter((b) => b.rows.length > 0);
@@ -468,68 +649,174 @@ export default function App() {
       if (sortMode === 'delta') return b.maxAbsDelta - a.maxAbsDelta;
       return a.name.localeCompare(b.name);
     });
-
     return list;
   }, [moduleBlocks, searchFilter, onlyDiffRows, significantOnly, sortMode]);
 
+  const expandChanged = () => {
+    const next = {};
+    filteredBlocks.forEach((b) => {
+      if (b.totalDiffChanges > 0 && b.rows.length <= HIGH_CARDINALITY) next[b.name] = true;
+    });
+    setExpandedModules(next);
+  };
+
   // ----------------------------------------------------
-  // ФИЛЬТРАЦИЯ РЕЕСТРА АНКЕТ
+  // Реестр заявок
   // ----------------------------------------------------
   const filteredApps = useMemo(() => {
     const q = registrySearch.toLowerCase().trim();
+    const invSet = activeInvestigateCheck ? new Set(activeInvestigateCheck.appIds.map(normId)) : null;
+    const target = selectedPivotFilter ? String(selectedPivotFilter.value).toUpperCase() : null;
 
-    return applications.filter((app) => {
-      const appId = String(app.app_id || app.id || '');
-      const decAfter = app.afterDecision || app.decision_after || '—';
-
-      if (q && !appId.toLowerCase().includes(q)) return false;
-      if (registryStatusFilter !== 'ALL' && decAfter !== registryStatusFilter) return false;
-
-      if (selectedPivotFilter) {
-        const targetVal = String(selectedPivotFilter.value).toUpperCase();
-        if (selectedPivotFilter.direction === 'LEFT') {
-          return decAfter.toUpperCase() !== targetVal;
-        }
-        if (selectedPivotFilter.direction === 'ARRIVED') {
-          return decAfter.toUpperCase() === targetVal;
-        }
-        const diffCnt = Number(app.diffCount ?? app.diff_count ?? 0);
-        return diffCnt > 0;
-      }
-      return true;
-    });
-  }, [applications, registrySearch, registryStatusFilter, selectedPivotFilter]);
-
-  // Добавление нового аналитика
-  const handleCreateAnalyst = (e) => {
-    e.preventDefault();
-    if (!newUserName.trim()) return;
-
-    const newAnalyst = {
-      id: String(Date.now()),
-      name: newUserName.trim(),
-      username: newUserUsername.trim() || newUserName.trim().toLowerCase().replace(/\s+/g, '_'),
-      role: newUserRole.trim() || 'Риск-аналитик'
+    const risk = (a) => {
+      const rb = severityRank(a.beforeDecision);
+      const ra = severityRank(a.afterDecision);
+      return rb !== null && ra !== null ? ra - rb : 0;
     };
 
-    setAnalysts((prev) => [...prev, newAnalyst]);
-    authenticateAnalyst(newAnalyst);
-    setNewUserName('');
-    setNewUserUsername('');
-    setIsAddUserModalOpen(false);
+    return applications
+      .filter((app) => {
+        if (q && !app.app_id.toLowerCase().includes(q)) return false;
+        if (invSet && !invSet.has(app.app_id)) return false;
+        if (registryStatusFilter !== 'ALL' && app.afterDecision !== registryStatusFilter && app.beforeDecision !== registryStatusFilter) {
+          return false;
+        }
+        if (selectedPivotFilter) {
+          if (!hasDecisions) return app.diffCount > 0; // решений от бэка нет, остаётся только факт расхождения
+          if (selectedPivotFilter.direction === 'LEFT') return app.beforeDecision === target && app.afterDecision !== target;
+          if (selectedPivotFilter.direction === 'ARRIVED') return app.afterDecision === target && app.beforeDecision !== target;
+          return app.diffCount > 0;
+        }
+        return true;
+      })
+      .sort((a, b) => risk(b) - risk(a) || b.diffCount - a.diffCount); // срывы наверх
+  }, [applications, registrySearch, activeInvestigateCheck, registryStatusFilter, selectedPivotFilter, hasDecisions]);
+
+  const getAppDriverBadge = (app) => {
+    const b = app.beforeDecision;
+    const a = app.afterDecision;
+    if (b !== '—' && a !== '—' && b !== a) {
+      const rb = severityRank(b);
+      const ra = severityRank(a);
+      if (rb !== null && ra !== null && ra > rb) {
+        return (
+          <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-200">
+            ● Ужесточение: {b} → {a}
+          </span>
+        );
+      }
+      if (rb !== null && ra !== null && ra < rb) {
+        return (
+          <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+            ● Смягчение: {b} → {a}
+          </span>
+        );
+      }
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-bold bg-blue-50 text-blue-800 border border-blue-200">
+          ● Смена решения: {b} → {a}
+        </span>
+      );
+    }
+    if (app.diffCount > 0) {
+      return (
+        <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-amber-50 text-amber-800 border border-amber-200">
+          Сдвиг параметров ({app.diffCount} diff)
+        </span>
+      );
+    }
+    return <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] text-slate-400">Стабильно (MATCH)</span>;
   };
 
-  // Экспорт автономного HTML
+  const handleInvestigateCheck = (check) => {
+    if (!check.APP_IDS || check.APP_IDS.length === 0) return;
+    setActiveInvestigateCheck({ label: check.LABEL, argument: check.ARGUMENT, appIds: check.APP_IDS, cnt: check.CNT });
+    setRegistryStatusFilter('ALL');
+    setSelectedPivotFilter(null);
+    setRegistryLimit(APPS_PAGE);
+    setActiveTab('registry');
+  };
+
+  // ----------------------------------------------------
+  // Досье
+  // ----------------------------------------------------
+  const handleOpenDossier = useCallback(
+    async (rawAppId) => {
+      const clean = normId(rawAppId);
+      if (!clean) return;
+      const reqNo = (dossierReq.current += 1);
+      setActiveDossierAppId(clean);
+      setDossierRows([]);
+      setDossierError(null);
+      setDossierSearch('');
+      setIsDossierLoading(true);
+
+      let rows = null;
+      if (apiStatus === 'connected') {
+        try {
+          const res = await fetch(api(`/api/reports/${runId}/applications/${encodeURIComponent(clean)}/diff`));
+          if (res.ok) rows = await res.json();
+          else setDossierError(`Бэкенд ответил HTTP ${res.status}`);
+        } catch (e) {
+          setDossierError(String(e.message || e));
+        }
+      }
+      if (reqNo !== dossierReq.current) return; // пришёл ответ на устаревший клик
+
+      if ((!Array.isArray(rows) || rows.length === 0) && apiStatus === 'fallback' && fallbackComparisonCsv) {
+        rows = parseSemicolonCsv(fallbackComparisonCsv).filter((r) => normId(r.APP_ID) === clean);
+      }
+      setDossierRows(Array.isArray(rows) ? rows : []);
+      setIsDossierLoading(false);
+    },
+    [runId, apiStatus]
+  );
+
+  const visibleDossierRows = useMemo(() => {
+    const q = dossierSearch.toLowerCase().trim();
+    return dossierRows
+      .filter((r) => !dossierOnlyDiff || Number(r.DIFF_FLAG) === 1)
+      .filter((r) => {
+        if (!q) return true;
+        const hay = `${r.PREFIX} ${r.CLASS} ${paramPath(r)} ${r.VALUE_BEFORE} ${r.VALUE_AFTER} ${r.COMMENT}`.toLowerCase();
+        return hay.includes(q);
+      });
+  }, [dossierRows, dossierOnlyDiff, dossierSearch]);
+
+  const diffRowsCount = useMemo(() => dossierRows.filter((r) => Number(r.DIFF_FLAG) === 1).length, [dossierRows]);
+
+  // ----------------------------------------------------
+  // Экспорт HTML
+  // ----------------------------------------------------
   const handleExportHtml = () => {
     const reportDate = new Date().toLocaleString('ru-RU');
+    const runInfo = availableRuns.find((r) => String(r.id) === String(runId));
+    const rows = checksResults
+      .map(
+        (c) => `
+          <tr>
+            <td><b>${escapeHtml(c.LABEL)}</b>${c.ESTIMATE ? ' <i>(оценка по витрине)</i>' : ''}</td>
+            <td><code>${escapeHtml(c.ARGUMENT)}</code></td>
+            <td>${escapeHtml(c.METRIC === null ? '—' : fmtPct(c.METRIC))}</td>
+            <td>${escapeHtml(c.CNT)} из ${escapeHtml(c.TOTAL || '—')}</td>
+            <td><span class="${c.RESULT === 'PASS' ? 'badge-pass' : 'badge-fail'}">${escapeHtml(c.RESULT)}</span></td>
+          </tr>`
+      )
+      .join('');
+    const decRows = decisionRows
+      .map(
+        (r) => `<tr><td>${escapeHtml(r.value)}</td><td>${r.masterTotal}</td><td>-${r.leftCount}</td><td>+${r.arrivedCount}</td><td>${r.betaTotal}</td></tr>`
+      )
+      .join('');
+
     const content = `<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>СПР • Аудит кредитного риска — Прогон #${runId}</title>
+  <title>СПР • Аудит кредитного риска — Прогон #${escapeHtml(runId)}</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f8fafc; color: #0f172a; padding: 32px; }
-    .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    .card { background: #fff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 20px; margin-bottom: 24px; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 12px; }
     th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #e2e8f0; }
     th { background: #f1f5f9; color: #475569; font-size: 11px; text-transform: uppercase; }
@@ -538,87 +825,94 @@ export default function App() {
   </style>
 </head>
 <body>
-  <h2>Отчёт аудита кредитных стратегий СПР (Прогон #${runId})</h2>
-  <p style="color:#64748b;font-size:12px;">Сформировано: ${reportDate} | Аналитик: ${currentUser.name} (${currentUser.role})</p>
-  
+  <h2>Отчёт аудита кредитных стратегий СПР (Прогон #${escapeHtml(runId)})</h2>
+  <p style="color:#64748b;font-size:12px;">${escapeHtml(runInfo?.config?.runTag || '')} · Сформировано: ${escapeHtml(reportDate)} · Аналитик: ${escapeHtml(currentUser.name)} (${escapeHtml(currentUser.role)})</p>
   <div class="card">
-    <h3>Macro Impact (Сводка портфеля)</h3>
-    <p>Всего анкет в выборке: <b>${summaryMetrics.totalPortfolio}</b></p>
+    <h3>Macro Impact</h3>
+    <p>Анкет в выборке: <b>${summaryMetrics.totalPortfolio}</b></p>
     <p>Сменили решение (Flips): <b>${summaryMetrics.totalFlips} (${summaryMetrics.flipsPct}%)</b></p>
+    <table><thead><tr><th>Исход</th><th>MASTER</th><th>Ушло</th><th>Пришло</th><th>BETA</th></tr></thead><tbody>${decRows}</tbody></table>
   </div>
-
   <div class="card">
-    <h3>Исполнение проверок качества (Quality Gates)</h3>
+    <h3>Проверки (Quality Gates)</h3>
     <table>
       <thead><tr><th>Правило</th><th>Аргумент</th><th>Метрика</th><th>Факт</th><th>Статус</th></tr></thead>
-      <tbody>
-        ${checksResults.map((c) => `
-          <tr>
-            <td><b>${c.LABEL || c.label || '—'}</b></td>
-            <td><code>${c.ARGUMENT || c.argument || '—'}</code></td>
-            <td>${c.METRIC ?? c.metric ?? '—'}</td>
-            <td>${c.CNT ?? c.cnt ?? 0} из ${c.TOTAL ?? c.total ?? '—'}</td>
-            <td><span class="${(c.RESULT || c.result) === 'PASS' ? 'badge-pass' : 'badge-fail'}">${c.RESULT || c.result}</span></td>
-          </tr>`).join('')}
-      </tbody>
+      <tbody>${rows}</tbody>
     </table>
   </div>
 </body>
 </html>`;
 
-    const blob = new Blob(['\ufeff' + content], { type: 'text/html;charset=utf-8' });
+    const blob = new Blob(['﻿' + content], { type: 'text/html;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
     link.download = `SPR_Audit_Report_Run_${runId}.html`;
+    document.body.appendChild(link);
     link.click();
-    URL.revokeObjectURL(url);
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
+
+  // ----------------------------------------------------
+  // Шаги пайплайна для отображения
+  // ----------------------------------------------------
+  const stepDuration = (s) => {
+    if (!s.started_at || !s.finished_at) return null;
+    const sec = (new Date(s.finished_at) - new Date(s.started_at)) / 1000;
+    return Number.isFinite(sec) ? `${sec.toFixed(1)} с` : null;
+  };
+  const stepBadge = (status) => {
+    const v = String(status || '').toLowerCase();
+    if (TERMINAL_OK.includes(v)) return 'bg-emerald-100 text-emerald-800';
+    if (TERMINAL_FAIL.includes(v)) return 'bg-rose-100 text-rose-800';
+    if (v === 'running') return 'bg-blue-100 text-blue-800 animate-pulse';
+    return 'bg-slate-100 text-slate-600';
+  };
+
+  const runOptions = availableRuns.length > 0 ? availableRuns : [{ id: 'demo', status: 'demo', config: { runTag: 'демо-данные' } }];
+  const isFallback = apiStatus === 'fallback';
 
   return (
     <div className="min-h-screen bg-slate-50/70 text-slate-900 font-sans flex flex-col antialiased">
-      {/* ==========================================
-          ШАПКА (СВЕТЛАЯ FINTECH ТЕМА)
-      ========================================== */}
+      {/* ШАПКА */}
       <header className="border-b border-slate-200 bg-white px-6 py-2.5 flex flex-wrap items-center justify-between gap-4 sticky top-0 z-30 shadow-sm">
         <div className="flex items-center gap-3">
-          <span className={`w-2.5 h-2.5 rounded-full ${apiStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+          <span
+            className={`inline-flex items-center gap-1.5 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+              apiStatus === 'connected'
+                ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                : apiStatus === 'fallback'
+                ? 'bg-amber-50 text-amber-700 border-amber-200'
+                : 'bg-slate-50 text-slate-500 border-slate-200'
+            }`}
+          >
+            <span
+              className={`w-2 h-2 rounded-full ${
+                apiStatus === 'connected' ? 'bg-emerald-500 animate-pulse' : apiStatus === 'fallback' ? 'bg-amber-500' : 'bg-slate-400'
+              }`}
+            />
+            {apiStatus === 'connected' ? 'ONLINE' : apiStatus === 'fallback' ? 'FALLBACK' : '…'}
+          </span>
           <span className="font-bold text-sm text-slate-800">СПР • Аудит кредитных стратегий</span>
-          
-          {/* Селектор прогонов */}
+
           <div className="flex items-center gap-1.5 bg-slate-100 border border-slate-200 rounded-lg px-2 py-0.5 text-xs font-mono">
             <span className="text-slate-500 font-sans">Прогон:</span>
-            {availableRuns.length > 0 ? (
-              <select
-                value={runId || ''}
-                onChange={(e) => setRunId(e.target.value)}
-                className="bg-transparent border-none outline-none font-bold text-blue-700 cursor-pointer"
-              >
-                {availableRuns.map((r) => (
-                  <option key={r.id || r.run_id} value={r.id || r.run_id}>
-                    #{r.id || r.run_id} {r.status ? `(${r.status})` : ''}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                type="text"
-                value={runId || ''}
-                onChange={(e) => setRunId(e.target.value)}
-                className="w-10 bg-white border border-slate-300 rounded px-1 text-center font-bold text-blue-700"
-              />
-            )}
-            <button
-              onClick={() => runId && fetchReportData(runId)}
-              className="text-slate-600 hover:text-blue-600 font-bold px-1"
-              title="Обновить данные"
+            <select
+              value={runId || ''}
+              onChange={(e) => setRunId(e.target.value)}
+              className="bg-transparent border-none outline-none font-bold text-blue-700 cursor-pointer max-w-64"
             >
-              ↻
-            </button>
+              {runOptions.map((r) => (
+                <option key={r.id} value={r.id}>
+                  #{r.id} · {r.config?.runTag || r.status || 'done'}
+                </option>
+              ))}
+            </select>
           </div>
+          {isLoadingApi && <span className="text-xs text-blue-600 animate-pulse font-semibold">Загрузка…</span>}
         </div>
 
-        {/* Навигация */}
         <nav className="flex gap-1 bg-slate-100 p-1 rounded-lg text-xs font-semibold">
           {[
             { id: 'matrix', label: 'Сводный отчёт (Витрина)' },
@@ -637,15 +931,14 @@ export default function App() {
           ))}
         </nav>
 
-        {/* Селектор аналитика + Кнопка добавления + Экспорт */}
         <div className="flex items-center gap-2 text-xs">
           <div className="flex items-center bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-sm">
             <span className="text-slate-400 mr-1.5">👤</span>
             <select
               value={currentUser.id}
               onChange={(e) => {
-                const found = analysts.find((a) => a.id === e.target.value);
-                if (found) authenticateAnalyst(found);
+                const f = analysts.find((a) => a.id === e.target.value);
+                if (f) setCurrentUser(f);
               }}
               className="bg-transparent border-none outline-none font-semibold text-slate-700 cursor-pointer"
             >
@@ -656,15 +949,12 @@ export default function App() {
               ))}
             </select>
           </div>
-
           <button
             onClick={() => setIsAddUserModalOpen(true)}
             className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
-            title="Создать новую учётную запись аналитика"
           >
             + Аналитик
           </button>
-
           <button
             onClick={handleExportHtml}
             className="px-3 py-1 rounded-lg font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition shadow-sm cursor-pointer"
@@ -674,66 +964,161 @@ export default function App() {
         </div>
       </header>
 
-      {/* ==========================================
-          ВКЛАДКА 1: СВОДНЫЙ ОТЧЁТ И ВИТРИНА
-      ========================================== */}
+      {isFallback && (
+        <div className="bg-amber-50 border-b border-amber-200 text-amber-900 text-xs px-6 py-2">
+          <b>Демо-режим:</b> бэкенд недоступен, показаны локальные демонстрационные данные. Запуск прогонов отключён.
+        </div>
+      )}
+      {loadError && (
+        <div className="bg-rose-50 border-b border-rose-200 text-rose-900 text-xs px-6 py-2">
+          <b>Ошибка загрузки прогона #{runId}:</b> {loadError}
+        </div>
+      )}
+
+      {/* ВКЛАДКА 1 */}
       {activeTab === 'matrix' && (
         <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-6">
-          {/* 1. БЫСТРАЯ ОСНОВНАЯ ИНФОРМАЦИЯ (EXECUTIVE SUMMARY) */}
+          {/* Метрики */}
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
               <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Всего анкет в выборке</div>
-              <div className="text-2xl font-extrabold text-slate-900 font-mono mt-1">
-                {summaryMetrics.totalPortfolio.toLocaleString('ru-RU')}
-              </div>
-              <div className="text-[11px] text-slate-400 mt-1">Данные витрины pivot-facts</div>
+              <div className="text-2xl font-extrabold text-slate-900 font-mono mt-1">{portfolioSize.toLocaleString('ru-RU')}</div>
             </div>
-
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Смена кредитного решения (Flips)</div>
+              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Смена решения (Flips)</div>
               <div className="flex items-baseline justify-between mt-1">
-                <div className="text-2xl font-extrabold text-amber-600 font-mono">{summaryMetrics.totalFlips}</div>
-                <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
-                  {summaryMetrics.flipsPct}% выборки
-                </span>
+                <div className="text-2xl font-extrabold text-amber-600 font-mono">{summaryMetrics.totalFlips.toLocaleString('ru-RU')}</div>
+                <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">{summaryMetrics.flipsPct}% выборки</span>
               </div>
-              <div className="text-[11px] text-slate-400 mt-1">Анкеты с миграцией исхода</div>
             </div>
-
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Загружено в реестр</div>
+              <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Анкет с расхождениями</div>
               <div className="flex items-baseline justify-between mt-1">
-                <div className="text-2xl font-extrabold text-blue-600 font-mono">{applications.length}</div>
-                <span className="text-xs font-bold px-1.5 py-0.5 rounded bg-blue-50 text-blue-700">Из базы FastAPI</span>
+                <div className="text-2xl font-extrabold text-blue-600 font-mono">{changedApps.toLocaleString('ru-RU')}</div>
+                <span className="text-xs text-slate-500 font-mono">из {applications.length.toLocaleString('ru-RU')} в реестре</span>
               </div>
-              <div className="text-[11px] text-slate-400 mt-1">Доступен поатрибутный аудит</div>
             </div>
           </div>
 
-          {/* 2. ДИАГРАММА WATERFALL ПЕРЕТОКА РЕШЕНИЙ */}
+          {!isLoadingApi && pivotFacts.length === 0 && !loadError && (
+            <div className="bg-white border border-slate-200 rounded-xl p-6 text-sm text-slate-500 text-center">
+              Для прогона #{runId} нет данных витрины. Возможно, расчёт ещё не завершён.
+            </div>
+          )}
+
+          {/* Проверки */}
+          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+            <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
+              <div>
+                <h3 className="text-sm font-bold text-slate-800">Автоматические проверки стратегии (Quality Gates)</h3>
+                <p className="text-[11px] text-slate-500">
+                  Нажмите на синюю кнопку в колонке CNT, чтобы открыть затронутые анкеты в реестре
+                </p>
+              </div>
+              <div className="flex gap-2 text-xs font-bold">
+                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">PASS: {checksResults.filter((c) => c.RESULT === 'PASS').length}</span>
+                <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800">FAIL: {checksResults.filter((c) => c.RESULT === 'FAIL').length}</span>
+              </div>
+            </div>
+
+            {checksAreEstimates && (
+              <div className="px-5 py-2 bg-amber-50 border-b border-amber-200 text-[11px] text-amber-900">
+                {isFallback
+                  ? 'Демо-режим: проверки оценены по данным витрины.'
+                  : 'Бэкенд не вернул результаты проверок для этого прогона. Ниже оценки по данным витрины (не результат скриптов), список анкет для них недоступен.'}
+              </div>
+            )}
+
+            {checksResults.length === 0 ? (
+              <div className="p-6 text-center text-sm text-slate-500">Проверок нет.</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-white text-slate-500 border-b border-slate-200 font-semibold">
+                    <tr>
+                      <th className="py-2.5 px-4">Название проверки</th>
+                      <th className="py-2.5 px-4">Аргумент</th>
+                      <th className="py-2.5 px-4 text-center">Затронуто анкет (CNT)</th>
+                      <th className="py-2.5 px-4 text-center">Метрика</th>
+                      <th className="py-2.5 px-4 text-center">Статус</th>
+                      <th className="py-2.5 px-4 text-right">Код</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {checksResults.map((c, idx) => {
+                      const hasAppIds = c.APP_IDS.length > 0;
+                      const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID];
+                      return (
+                        <tr key={idx} className="hover:bg-slate-50 transition">
+                          <td className="py-2.5 px-4 font-semibold text-slate-800">
+                            {c.LABEL}
+                            {c.ESTIMATE && <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">оценка</span>}
+                            {c.CONFIDENCE === 'LOW' && (
+                              <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600" title="Мало анкет, результат ненадёжен">
+                                LOW
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 font-mono text-slate-600">
+                            <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px]">{c.ARGUMENT || '—'}</span>
+                          </td>
+                          <td className="py-2.5 px-4 text-center font-mono font-bold">
+                            {hasAppIds ? (
+                              <button
+                                onClick={() => handleInvestigateCheck(c)}
+                                className="px-2.5 py-1 rounded bg-blue-50 hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-300 font-bold transition cursor-pointer"
+                                title="Открыть эти анкеты в реестре"
+                              >
+                                🔍 {c.CNT} анкет ➔
+                              </button>
+                            ) : (
+                              <span className="text-slate-800">{c.CNT}</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-center font-mono text-slate-700">{c.METRIC === null ? '—' : fmtPct(c.METRIC)}</td>
+                          <td className="py-2.5 px-4 text-center">
+                            <span
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                c.RESULT === 'PASS'
+                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                  : 'bg-rose-100 text-rose-800 border border-rose-200'
+                              }`}
+                            >
+                              {c.RESULT || '—'}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-4 text-right">
+                            <button
+                              disabled={!code}
+                              onClick={() => setCodeModal({ isOpen: true, title: c.LABEL, code })}
+                              className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                            >
+                              Код ↗
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          {/* Waterfall */}
           {activeWaterfallRow && (
             <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-4">
               <div className="flex flex-wrap justify-between items-center gap-2 border-b border-slate-100 pb-3">
-                <div>
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600">
-                    Динамический баланс решений
-                  </span>
-                  <h3 className="text-sm font-bold text-slate-800">
-                    Диаграмма миграции (Waterfall): срез по исходу «{activeWaterfallRow.value}»
-                  </h3>
-                </div>
-
-                {/* Переключатель исходов для Waterfall (динамический) */}
-                <div className="flex items-center gap-1.5 bg-slate-100 p-1 rounded-lg text-xs font-semibold">
-                  <span className="text-slate-400 text-[11px] px-1 font-sans">Срез исхода:</span>
+                <h3 className="text-sm font-bold text-slate-800">
+                  Диаграмма миграции решений (Waterfall): срез по «{activeWaterfallRow.value}»
+                </h3>
+                <div className="flex gap-1.5 bg-slate-100 p-1 rounded-lg text-xs font-semibold">
                   {decisionRows.map((dr) => (
                     <button
                       key={dr.id}
                       onClick={() => setWaterfallTargetBucket(dr.value)}
                       className={`px-2.5 py-0.5 rounded-md transition cursor-pointer ${
-                        activeWaterfallRow.value === dr.value
-                          ? 'bg-white text-slate-900 shadow-sm font-bold'
-                          : 'text-slate-600 hover:text-slate-900'
+                        activeWaterfallRow.value === dr.value ? 'bg-white text-slate-900 shadow-sm font-bold' : 'text-slate-600'
                       }`}
                     >
                       {dr.value}
@@ -742,85 +1127,34 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Столбики диаграммы */}
               {(() => {
-                const maxVal = Math.max(
-                  activeWaterfallRow.masterTotal,
-                  activeWaterfallRow.betaTotal,
-                  activeWaterfallRow.stableCount,
-                  1
-                );
-                const getHeight = (val) => Math.max(Math.round((val / maxVal) * 110), 18);
-
+                const w = activeWaterfallRow;
+                const maxVal = Math.max(w.masterTotal, w.betaTotal, w.stableCount, 1);
+                const getHeight = (val) => (val === 0 ? 2 : Math.max(Math.round((val / maxVal) * 110), 6));
                 const bars = [
-                  {
-                    label: 'MASTER (Было)',
-                    val: activeWaterfallRow.masterTotal,
-                    sub: 'было в срезе',
-                    color: 'bg-slate-700 hover:bg-slate-800',
-                    textColor: 'text-slate-800',
-                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ALL' })
-                  },
-                  {
-                    label: 'Сохранено (DIFF=0)',
-                    val: activeWaterfallRow.stableCount,
-                    sub: 'без изменений',
-                    color: 'bg-slate-400 hover:bg-slate-500',
-                    textColor: 'text-slate-600',
-                    onClick: null
-                  },
-                  {
-                    label: 'Ушло в другие (-)',
-                    val: activeWaterfallRow.leftCount,
-                    prefix: '-',
-                    sub: 'клик ➔ анкеты',
-                    color: 'bg-rose-500 hover:bg-rose-600 ring-2 ring-rose-200',
-                    textColor: 'text-rose-600 font-bold',
-                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'LEFT' })
-                  },
-                  {
-                    label: 'Пришло из других (+)',
-                    val: activeWaterfallRow.arrivedCount,
-                    prefix: '+',
-                    sub: 'клик ➔ анкеты',
-                    color: 'bg-emerald-500 hover:bg-emerald-600 ring-2 ring-emerald-200',
-                    textColor: 'text-emerald-600 font-bold',
-                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ARRIVED' })
-                  },
-                  {
-                    label: 'BETA (Стало)',
-                    val: activeWaterfallRow.betaTotal,
-                    sub: `дельта: ${activeWaterfallRow.netDelta >= 0 ? '+' : ''}${activeWaterfallRow.netDelta}`,
-                    color: 'bg-blue-600 hover:bg-blue-700',
-                    textColor: 'text-blue-700 font-bold',
-                    onClick: () => setSelectedPivotFilter({ rowId: activeWaterfallRow.id, value: activeWaterfallRow.value, direction: 'ARRIVED' })
-                  }
+                  { label: 'MASTER (Было)', val: w.masterTotal, color: 'bg-slate-700', text: 'text-slate-800' },
+                  { label: 'Сохранено (DIFF=0)', val: w.stableCount, color: 'bg-slate-400', text: 'text-slate-600' },
+                  { label: 'Ушло (-)', val: w.leftCount, prefix: '-', color: 'bg-rose-500 ring-2 ring-rose-200', text: 'text-rose-600 font-bold' },
+                  { label: 'Пришло (+)', val: w.arrivedCount, prefix: '+', color: 'bg-emerald-500 ring-2 ring-emerald-200', text: 'text-emerald-600 font-bold' },
+                  { label: 'BETA (Стало)', val: w.betaTotal, color: 'bg-blue-600', text: 'text-blue-700 font-bold' }
                 ];
-
                 return (
                   <div className="pt-2 pb-1 px-3 bg-slate-50/80 rounded-xl border border-slate-100">
                     <div className="grid grid-cols-5 gap-3 items-end h-36 pt-4 px-2">
                       {bars.map((b, idx) => (
-                        <div
-                          key={idx}
-                          onClick={b.onClick || undefined}
-                          className={`flex flex-col items-center justify-end h-full ${b.onClick ? 'cursor-pointer group' : ''}`}
-                        >
-                          <div className={`text-xs font-mono mb-1 ${b.textColor}`}>
-                            {b.prefix || ''}{b.val}
+                        <div key={idx} className="flex flex-col items-center justify-end h-full">
+                          <div className={`text-xs font-mono mb-1 ${b.text}`}>
+                            {b.prefix || ''}
+                            {b.val}
                           </div>
-                          <div
-                            style={{ height: `${getHeight(b.val)}px` }}
-                            className={`w-full max-w-16 rounded-t-lg transition-all duration-300 shadow-sm ${b.color}`}
-                          />
+                          <div style={{ height: `${getHeight(b.val)}px` }} className={`w-full max-w-16 rounded-t-lg shadow-sm ${b.color}`} />
                         </div>
                       ))}
                     </div>
-                    <div className="grid grid-cols-5 gap-3 border-t border-slate-200 pt-2 pb-1 text-center font-sans">
+                    <div className="grid grid-cols-5 gap-3 border-t border-slate-200 pt-2 pb-1 text-center">
                       {bars.map((b, idx) => (
-                        <div key={idx}>
-                          <div className="text-[11px] font-bold text-slate-700 leading-tight">{b.label}</div>
-                          <div className="text-[10px] text-slate-400 mt-0.5">{b.sub}</div>
+                        <div key={idx} className="text-[11px] font-bold text-slate-700">
+                          {b.label}
                         </div>
                       ))}
                     </div>
@@ -830,174 +1164,108 @@ export default function App() {
             </div>
           )}
 
-          {/* 3. ПРОВЕРКИ РИСК-ПОЛИТИКИ ИЗ РЕПОЗИТОРИЯ (GET /api/reports/{id}/checks) */}
-          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex justify-between items-center">
-              <div>
-                <h3 className="text-sm font-bold text-slate-800">Автоматические проверки стратегии (Quality Gates)</h3>
-                <p className="text-[11px] text-slate-500">Результаты расчета проверок из репозитория проекта</p>
+          {/* Баланс решений */}
+          {decisionRows.length > 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="px-5 py-3.5 bg-slate-900 text-white flex justify-between items-center">
+                <div>
+                  <h3 className="text-sm font-bold">Сводный баланс кредитных решений</h3>
+                  <p className="text-[11px] text-slate-300">
+                    <code>MASTER (Было)</code> − <code>Ушло</code> + <code>Пришло</code> = <code>BETA (Стало)</code>
+                  </p>
+                </div>
+                {selectedPivotFilter && (
+                  <button
+                    onClick={() => setSelectedPivotFilter(null)}
+                    className="text-xs bg-white/20 hover:bg-white/30 text-white px-2.5 py-1 rounded transition cursor-pointer"
+                  >
+                    ✕ Сбросить срез ({selectedPivotFilter.value})
+                  </button>
+                )}
               </div>
-              <div className="flex gap-2 text-xs font-bold">
-                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                  PASS: {checksResults.filter((c) => (c.RESULT || c.result) === 'PASS').length}
-                </span>
-                <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800">
-                  FAIL: {checksResults.filter((c) => (c.RESULT || c.result) === 'FAIL').length}
-                </span>
-              </div>
-            </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs">
-                <thead className="bg-white text-slate-500 border-b border-slate-200 font-semibold">
-                  <tr>
-                    <th className="py-2.5 px-4">Название проверки (LABEL)</th>
-                    <th className="py-2.5 px-4">Аргумент</th>
-                    <th className="py-2.5 px-4 text-center">Затронуто анкет (CNT)</th>
-                    <th className="py-2.5 px-4 text-center">Метрика</th>
-                    <th className="py-2.5 px-4 text-center">Статус</th>
-                    <th className="py-2.5 px-4 text-right">Код</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {checksResults.length === 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs font-mono">
+                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
                     <tr>
-                      <td colSpan={6} className="py-4 text-center text-slate-400">
-                        Нет сохраненных результатов проверок в базе для этого прогона
-                      </td>
+                      <th className="py-2.5 px-4">Исход (VALUE)</th>
+                      <th className="py-2.5 px-4 text-center font-bold text-slate-800">MASTER (Было)</th>
+                      <th className="py-2.5 px-4 text-center text-slate-500">Без изменений</th>
+                      <th className="py-2.5 px-4 text-center text-rose-700 bg-rose-50/50">Ушло (-LEFT)</th>
+                      <th className="py-2.5 px-4 text-center text-emerald-700 bg-emerald-50/50">Пришло (+ARRIVED)</th>
+                      <th className="py-2.5 px-4 text-center font-bold text-slate-900">BETA (Стало)</th>
+                      <th className="py-2.5 px-4 text-center font-sans">Чистый сдвиг (Δ)</th>
                     </tr>
-                  ) : (
-                    checksResults.map((c, idx) => {
-                      const label = c.LABEL || c.label || 'Проверка';
-                      const res = c.RESULT || c.result || 'PASS';
-                      const arg = c.ARGUMENT || c.argument || '—';
-                      const cnt = c.CNT ?? c.cnt ?? 0;
-                      const metric = c.METRIC ?? c.metric ?? '—';
-                      const checkId = Object.keys(REPO_PYTHON_SCRIPTS).find((k) => label.toLowerCase().includes(k)) || 'ar_drop_by_product';
-
-                      return (
-                        <tr key={idx} className="hover:bg-slate-50 transition">
-                          <td className="py-2.5 px-4 font-semibold text-slate-800">{label}</td>
-                          <td className="py-2.5 px-4 font-mono text-slate-600">
-                            <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px]">{arg}</span>
-                          </td>
-                          <td className="py-2.5 px-4 text-center font-mono font-bold text-slate-800">{cnt}</td>
-                          <td className="py-2.5 px-4 text-center font-mono text-slate-700">{metric}</td>
-                          <td className="py-2.5 px-4 text-center">
-                            <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                              res === 'PASS'
-                                ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                                : 'bg-rose-100 text-rose-800 border border-rose-200'
-                            }`}>
-                              {res}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-4 text-right">
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {decisionRows.map((r) => (
+                      <tr key={r.id} className="hover:bg-slate-50">
+                        <td className="py-2.5 px-4 font-bold text-slate-900">
+                          <span className={`px-2 py-0.5 rounded text-[11px] ${decisionClass(r.value)}`}>{r.value}</span>
+                        </td>
+                        <td className="py-2.5 px-4 text-center font-bold text-slate-800">{r.masterTotal}</td>
+                        <td className="py-2.5 px-4 text-center text-slate-400">{r.stableCount}</td>
+                        <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans">
+                          {r.leftCount > 0 ? (
                             <button
-                              onClick={() => setCodeModal({ isOpen: true, title: label, code: REPO_PYTHON_SCRIPTS[checkId] || '# Код проверки в репозитории\n' })}
-                              className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer"
+                              onClick={() => {
+                                setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'LEFT' });
+                                setActiveInvestigateCheck(null);
+                                setRegistryLimit(APPS_PAGE);
+                              }}
+                              className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
+                                selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'LEFT'
+                                  ? 'bg-rose-600 text-white ring-2 ring-rose-300'
+                                  : 'bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800'
+                              }`}
+                              title="Анкеты, ушедшие из этого исхода"
                             >
-                              Код ↗
+                              -{r.leftCount} ▼
                             </button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* 4. ПОЛНЫЙ БАЛАНС ПЕРЕТОКА РЕШЕНИЙ (УНИВЕРСАЛЬНЫЙ DATA-AGNOSTIC) */}
-          <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-            <div className="px-5 py-3.5 bg-slate-900 text-white flex justify-between items-center">
-              <div>
-                <h3 className="text-sm font-bold">Сводный баланс кредитных решений (Полная арифметика перетока)</h3>
-                <p className="text-[11px] text-slate-300">
-                  Формула: <code>MASTER (Было)</code> - <code>Ушло</code> + <code>Пришло</code> = <code>BETA (Стало)</code>
-                </p>
+                          ) : (
+                            '0'
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans">
+                          {r.arrivedCount > 0 ? (
+                            <button
+                              onClick={() => {
+                                setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'ARRIVED' });
+                                setActiveInvestigateCheck(null);
+                                setRegistryLimit(APPS_PAGE);
+                              }}
+                              className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
+                                selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'ARRIVED'
+                                  ? 'bg-emerald-600 text-white ring-2 ring-emerald-300'
+                                  : 'bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800'
+                              }`}
+                              title="Анкеты, пришедшие в этот исход"
+                            >
+                              +{r.arrivedCount} ▼
+                            </button>
+                          ) : (
+                            '0'
+                          )}
+                        </td>
+                        <td className="py-2.5 px-4 text-center font-bold text-slate-900">{r.betaTotal}</td>
+                        <td className="py-2.5 px-4 text-center font-bold font-sans">
+                          {r.netDelta > 0 ? (
+                            <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">+{r.netDelta}</span>
+                          ) : r.netDelta < 0 ? (
+                            <span className="bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded">{r.netDelta}</span>
+                          ) : (
+                            '0'
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-              {selectedPivotFilter && (
-                <button
-                  onClick={() => setSelectedPivotFilter(null)}
-                  className="text-xs bg-white/20 hover:bg-white/30 text-white px-2.5 py-1 rounded transition cursor-pointer"
-                >
-                  ✕ Сбросить фильтр с таблицы ({selectedPivotFilter.value})
-                </button>
-              )}
             </div>
+          )}
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-xs font-mono">
-                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
-                  <tr>
-                    <th className="py-2.5 px-4">Параметр (KEY)</th>
-                    <th className="py-2.5 px-4">Исход (VALUE)</th>
-                    <th className="py-2.5 px-4 text-center font-bold text-slate-800">MASTER (Было)</th>
-                    <th className="py-2.5 px-4 text-center text-slate-500">Без изменений (DIFF=0)</th>
-                    <th className="py-2.5 px-4 text-center text-rose-700 bg-rose-50/50">Ушло в др. (-LEFT)</th>
-                    <th className="py-2.5 px-4 text-center text-emerald-700 bg-emerald-50/50">Пришло из др. (+ARRIVED)</th>
-                    <th className="py-2.5 px-4 text-center font-bold text-slate-900">BETA (Стало)</th>
-                    <th className="py-2.5 px-4 text-center font-sans">Чистый сдвиг (Δ)</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {decisionRows.map((r) => (
-                    <tr key={r.id} className="hover:bg-slate-50">
-                      <td className="py-2.5 px-4 font-sans text-slate-600">{r.key}</td>
-                      <td className="py-2.5 px-4 font-bold text-slate-900">{r.value}</td>
-                      <td className="py-2.5 px-4 text-center font-bold text-slate-800">{r.masterTotal}</td>
-                      <td className="py-2.5 px-4 text-center text-slate-400">{r.stableCount}</td>
-
-                      <td className="py-2.5 px-4 text-center bg-rose-50/20 font-sans">
-                        {r.leftCount > 0 ? (
-                          <button
-                            onClick={() => setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'LEFT' })}
-                            className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
-                              selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'LEFT'
-                                ? 'bg-rose-600 text-white ring-2 ring-rose-300'
-                                : 'bg-rose-100 hover:bg-rose-600 hover:text-white text-rose-800'
-                            }`}
-                            title="Отфильтровать анкеты, ушедшие из этого исхода"
-                          >
-                            -{r.leftCount} ▼
-                          </button>
-                        ) : '0'}
-                      </td>
-
-                      <td className="py-2.5 px-4 text-center bg-emerald-50/20 font-sans">
-                        {r.arrivedCount > 0 ? (
-                          <button
-                            onClick={() => setSelectedPivotFilter({ rowId: r.id, value: r.value, direction: 'ARRIVED' })}
-                            className={`px-2.5 py-0.5 rounded font-mono font-bold text-xs transition cursor-pointer ${
-                              selectedPivotFilter?.rowId === r.id && selectedPivotFilter?.direction === 'ARRIVED'
-                                ? 'bg-emerald-600 text-white ring-2 ring-emerald-300'
-                                : 'bg-emerald-100 hover:bg-emerald-600 hover:text-white text-emerald-800'
-                            }`}
-                            title="Отфильтровать анкеты, пришедшие в этот исход"
-                          >
-                            +{r.arrivedCount} ▼
-                          </button>
-                        ) : '0'}
-                      </td>
-
-                      <td className="py-2.5 px-4 text-center font-bold text-slate-900">{r.betaTotal}</td>
-                      <td className="py-2.5 px-4 text-center font-bold font-sans">
-                        {r.netDelta > 0 ? (
-                          <span className="bg-emerald-100 text-emerald-800 px-1.5 py-0.5 rounded">+{r.netDelta}</span>
-                        ) : r.netDelta < 0 ? (
-                          <span className="bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded">{r.netDelta}</span>
-                        ) : '0'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-
-          {/* 5. ВИТРИНА МОДУЛЕЙ С ПАРАМЕТРАМИ */}
+          {/* Витрина модулей */}
           <div className="space-y-4">
             <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-wrap justify-between items-center gap-3">
               <div className="flex flex-wrap items-center gap-2">
@@ -1008,7 +1276,6 @@ export default function App() {
                   onChange={(e) => setSearchFilter(e.target.value)}
                   className="bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none w-64 focus:border-blue-500"
                 />
-
                 <button
                   onClick={() => setOnlyDiffRows(!onlyDiffRows)}
                   className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer ${
@@ -1017,7 +1284,6 @@ export default function App() {
                 >
                   Только расхождения (DIFF=1)
                 </button>
-
                 <button
                   onClick={() => setSignificantOnly(!significantOnly)}
                   className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer ${
@@ -1026,7 +1292,6 @@ export default function App() {
                 >
                   Сдвиги ≥ 10 анкет
                 </button>
-
                 <button
                   onClick={() => setSortMode(sortMode === 'impact' ? 'delta' : sortMode === 'delta' ? 'alpha' : 'impact')}
                   className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 text-white hover:bg-blue-600 transition cursor-pointer"
@@ -1036,66 +1301,89 @@ export default function App() {
                   {sortMode === 'alpha' && 'А–Я По алфавиту'}
                 </button>
               </div>
-
-              <div className="text-xs text-slate-500">
-                Модулей: <b>{filteredBlocks.length}</b>
+              <div className="flex items-center gap-2 text-xs text-slate-500">
+                <span>
+                  Модулей: <b>{filteredBlocks.length}</b>
+                </span>
+                <button onClick={expandChanged} className="px-2 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 font-semibold cursor-pointer">
+                  Развернуть изменённые
+                </button>
+                <button onClick={() => setExpandedModules({})} className="px-2 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 font-semibold cursor-pointer">
+                  Свернуть все
+                </button>
               </div>
             </div>
 
             {filteredBlocks.map((block) => {
-              const isCollapsed = !!collapsedModules[block.name];
+              const isOpen = !!expandedModules[block.name];
+              const limit = rowLimits[block.name] ?? ROWS_PER_MODULE;
+              const shown = block.rows.slice(0, limit);
               return (
                 <div key={block.name} className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
                   <div
-                    onClick={() => setCollapsedModules((p) => ({ ...p, [block.name]: !p[block.name] }))}
+                    onClick={() => setExpandedModules((p) => ({ ...p, [block.name]: !p[block.name] }))}
                     className="px-5 py-3 bg-slate-50 border-b border-slate-200 flex justify-between items-center cursor-pointer hover:bg-slate-100 transition"
                   >
                     <div className="flex items-center gap-2">
-                      <span className="text-xs text-slate-400 font-bold">{isCollapsed ? '▶' : '▼'}</span>
+                      <span className="text-xs text-slate-400 font-bold">{isOpen ? '▼' : '▶'}</span>
                       <span className="font-bold text-sm text-slate-800">{block.name}</span>
                       <span className="text-xs text-slate-500">({block.rows.length} бакетов)</span>
+                      {block.rows.length > HIGH_CARDINALITY && (
+                        <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-200 text-slate-600" title="Много уникальных значений (идентификаторы и т.п.)">
+                          высокая кардинальность
+                        </span>
+                      )}
                     </div>
                     <span className="text-xs font-semibold text-slate-600 bg-white border border-slate-200 px-2 py-0.5 rounded">
                       Макс. сдвиг: до <b>{block.maxAffectedClients}</b> анкет
                     </span>
                   </div>
 
-                  {!isCollapsed && (
+                  {isOpen && (
                     <div className="overflow-x-auto">
                       <table className="w-full text-left text-xs font-mono">
                         <thead className="bg-white text-slate-500 border-b border-slate-100 font-sans font-semibold">
                           <tr>
-                            <th className="py-2 px-4">Параметр (KEY)</th>
+                            <th className="py-2 px-4">Параметр</th>
                             <th className="py-2 px-4">Бакет (VALUE)</th>
-                            <th className="py-2 px-4 text-center">MASTER (Было)</th>
+                            <th className="py-2 px-4 text-center">MASTER</th>
                             <th className="py-2 px-4 text-center">DIFF=0</th>
-                            <th className="py-2 px-4 text-center text-rose-700">Ушло (-LEFT)</th>
-                            <th className="py-2 px-4 text-center text-emerald-700">Пришло (+ARRIVED)</th>
-                            <th className="py-2 px-4 text-center">BETA (Стало)</th>
-                            <th className="py-2 px-4 text-center">Дельта (Δ)</th>
+                            <th className="py-2 px-4 text-center text-rose-700">Ушло</th>
+                            <th className="py-2 px-4 text-center text-emerald-700">Пришло</th>
+                            <th className="py-2 px-4 text-center">BETA</th>
+                            <th className="py-2 px-4 text-center">Δ</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
-                          {block.rows.map((row) => (
+                          {shown.map((row) => (
                             <tr key={row.id} className={row.totalChanges > 0 ? 'bg-amber-50/20' : 'hover:bg-slate-50'}>
-                              <td className="py-2 px-4 text-slate-700 font-medium">{row.arrayKey ? `${row.arrayKey}.${row.key}` : row.key}</td>
-                              <td className="py-2 px-4 font-bold text-slate-900">{row.value}</td>
+                              <td className="py-2 px-4 text-slate-700 font-medium">{paramPath(row) || '(значение)'}</td>
+                              <td className="py-2 px-4 font-bold text-slate-900">
+                                {row.value === NO_VALUE ? <span className="text-slate-400 font-sans italic">нет атрибута</span> : row.value}
+                              </td>
                               <td className="py-2 px-4 text-center font-bold text-slate-700">{row.masterTotal}</td>
                               <td className="py-2 px-4 text-center text-slate-400">{row.stableCount}</td>
-                              <td className="py-2 px-4 text-center text-rose-600 font-bold">
-                                {row.leftCount > 0 ? `-${row.leftCount}` : '0'}
-                              </td>
-                              <td className="py-2 px-4 text-center text-emerald-600 font-bold">
-                                {row.arrivedCount > 0 ? `+${row.arrivedCount}` : '0'}
-                              </td>
+                              <td className="py-2 px-4 text-center text-rose-600 font-bold">{row.leftCount > 0 ? `-${row.leftCount}` : '0'}</td>
+                              <td className="py-2 px-4 text-center text-emerald-600 font-bold">{row.arrivedCount > 0 ? `+${row.arrivedCount}` : '0'}</td>
                               <td className="py-2 px-4 text-center font-bold text-slate-900">{row.betaTotal}</td>
-                              <td className="py-2 px-4 text-center font-bold">
-                                {row.netDelta > 0 ? `+${row.netDelta}` : row.netDelta}
-                              </td>
+                              <td className="py-2 px-4 text-center font-bold">{row.netDelta > 0 ? `+${row.netDelta}` : row.netDelta}</td>
                             </tr>
                           ))}
                         </tbody>
                       </table>
+                      {block.rows.length > limit && (
+                        <div className="px-5 py-2.5 border-t border-slate-100 flex items-center justify-between text-xs text-slate-500">
+                          <span>
+                            Показано {limit} из {block.rows.length}
+                          </span>
+                          <button
+                            onClick={() => setRowLimits((p) => ({ ...p, [block.name]: limit + ROWS_PER_MODULE }))}
+                            className="px-3 py-1 rounded border border-slate-300 bg-white hover:bg-slate-50 font-semibold cursor-pointer"
+                          >
+                            Показать ещё {ROWS_PER_MODULE}
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1105,21 +1393,44 @@ export default function App() {
         </main>
       )}
 
-      {/* ==========================================
-          ВКЛАДКА 2: РЕЕСТР АНКЕТ
-      ========================================== */}
+      {/* ВКЛАДКА 2: РЕЕСТР */}
       {activeTab === 'registry' && (
         <main className="flex-1 p-6 max-w-6xl w-full mx-auto space-y-4">
           <div className="bg-white p-5 rounded-xl border border-slate-200 shadow-sm space-y-4">
+            {activeInvestigateCheck && (
+              <div className="flex flex-wrap justify-between items-center gap-2 bg-rose-50 border border-rose-300 px-4 py-3 rounded-xl text-xs text-rose-900 shadow-sm">
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded bg-rose-600 text-white font-bold text-[10px]">РЕЖИМ РАССЛЕДОВАНИЯ</span>
+                  <span>
+                    Проверка: <b>{activeInvestigateCheck.label}</b> — показано {filteredApps.length} анкет
+                    {activeInvestigateCheck.cnt > activeInvestigateCheck.appIds.length &&
+                      ` (бэкенд отдаёт первые ${activeInvestigateCheck.appIds.length} из ${activeInvestigateCheck.cnt})`}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setActiveInvestigateCheck(null)}
+                  className="px-2.5 py-1 rounded bg-white hover:bg-rose-100 text-rose-800 border border-rose-300 font-bold cursor-pointer"
+                >
+                  ✕ Сбросить фильтр расследования
+                </button>
+              </div>
+            )}
+
+            {selectedPivotFilter && !hasDecisions && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-2 text-xs text-amber-900">
+                Бэкенд пока не возвращает решения по заявкам (beforeDecision/afterDecision пустые), поэтому срез «{selectedPivotFilter.value}»
+                показывает все заявки с расхождениями, а не только перешедшие в этот исход.
+              </div>
+            )}
+
             <div className="flex flex-wrap justify-between items-center gap-3 border-b border-slate-100 pb-3">
               <div>
                 <h3 className="text-base font-bold text-slate-800">Реестр кредитных заявок (Прогон #{runId})</h3>
                 <p className="text-xs text-slate-500">
-                  Показано: <b>{filteredApps.length} из {applications.length}</b> анкет из базы FastAPI
+                  Подходит: <b>{filteredApps.length}</b> из {applications.length} анкет · сверху заявки с наибольшим риском и числом расхождений
                 </p>
               </div>
-
-              {selectedPivotFilter && (
+              {selectedPivotFilter && !activeInvestigateCheck && (
                 <button
                   onClick={() => setSelectedPivotFilter(null)}
                   className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 rounded-lg border border-blue-200 cursor-pointer"
@@ -1132,38 +1443,42 @@ export default function App() {
             <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-50 p-3 rounded-lg">
               <input
                 type="text"
-                placeholder="Поиск по ID заявки (например: I32554354)..."
+                placeholder="Поиск по номеру анкеты (например: I32554354)..."
                 value={registrySearch}
-                onChange={(e) => setRegistrySearch(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && registrySearch.trim() && handleOpenDossier(registrySearch)}
+                onChange={(e) => {
+                  setRegistrySearch(e.target.value);
+                  setRegistryLimit(APPS_PAGE);
+                }}
                 className="bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none w-72 focus:border-blue-500 font-mono"
               />
-
-              <div className="flex items-center gap-1.5">
-                <button
-                  onClick={() => setRegistryStatusFilter('ALL')}
-                  className={`px-3 py-1 rounded-lg text-xs font-semibold border transition cursor-pointer ${
-                    registryStatusFilter === 'ALL'
-                      ? 'bg-blue-600 text-white border-blue-600'
-                      : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
-                  }`}
-                >
-                  Все ({applications.length})
-                </button>
-                {uniqueDecisions.map((dec) => (
+              {hasDecisions ? (
+                <div className="flex items-center gap-1.5 text-xs font-semibold">
                   <button
-                    key={dec}
-                    onClick={() => setRegistryStatusFilter(dec)}
-                    className={`px-3 py-1 rounded-lg text-xs font-semibold border transition cursor-pointer ${
-                      registryStatusFilter === dec
-                        ? 'bg-blue-600 text-white border-blue-600'
-                        : 'bg-white text-slate-600 border-slate-300 hover:bg-slate-100'
+                    onClick={() => setRegistryStatusFilter('ALL')}
+                    className={`px-3 py-1 rounded-lg border transition cursor-pointer ${
+                      registryStatusFilter === 'ALL' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300'
                     }`}
                   >
-                    {dec}
+                    Все ({applications.length})
                   </button>
-                ))}
-              </div>
+                  {uniqueDecisions.map((dec) => (
+                    <button
+                      key={dec}
+                      onClick={() => {
+                        setRegistryStatusFilter(dec);
+                        setRegistryLimit(APPS_PAGE);
+                      }}
+                      className={`px-3 py-1 rounded-lg border transition cursor-pointer ${
+                        registryStatusFilter === dec ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-600 border-slate-300'
+                      }`}
+                    >
+                      {dec}
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <span className="text-[11px] text-slate-400">Фильтры по исходам появятся, когда бэкенд вернёт решения по заявкам</span>
+              )}
             </div>
 
             <div className="overflow-x-auto border border-slate-200 rounded-lg">
@@ -1174,200 +1489,235 @@ export default function App() {
                     <th className="py-2.5 px-4">MASTER (Было)</th>
                     <th className="py-2.5 px-4">BETA (Стало)</th>
                     <th className="py-2.5 px-4 text-center">Расхождений (DIFF)</th>
-                    <th className="py-2.5 px-4 text-right font-sans">Действие</th>
+                    <th className="py-2.5 px-4">Главный триггер (Driver)</th>
+                    <th className="py-2.5 px-4 text-right">Действие</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredApps.length === 0 ? (
-                    <tr>
-                      <td colSpan={5} className="py-8 text-center text-slate-400 font-sans">
-                        Заявок по заданному критерию не обнаружено
+                  {filteredApps.slice(0, registryLimit).map((app) => (
+                    <tr
+                      key={app.app_id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => handleOpenDossier(app.app_id)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleOpenDossier(app.app_id)}
+                      className="hover:bg-blue-50/40 cursor-pointer transition font-sans"
+                    >
+                      <td className="py-3 px-4 font-bold font-mono text-slate-900">{app.app_id}</td>
+                      <td className="py-3 px-4 font-mono font-semibold">
+                        <span className={`px-2 py-0.5 rounded text-[11px] ${decisionClass(app.beforeDecision)}`}>{app.beforeDecision}</span>
+                      </td>
+                      <td className="py-3 px-4 font-mono font-bold">
+                        <span className={`px-2 py-0.5 rounded text-[11px] ${decisionClass(app.afterDecision)}`}>{app.afterDecision}</span>
+                      </td>
+                      <td className="py-3 px-4 text-center font-mono text-amber-700 font-bold">{app.diffCount} шт.</td>
+                      <td className="py-3 px-4">{getAppDriverBadge(app)}</td>
+                      <td className="py-3 px-4 text-right">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleOpenDossier(app.app_id);
+                          }}
+                          className="bg-slate-900 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs font-semibold transition cursor-pointer"
+                        >
+                          Открыть досье →
+                        </button>
                       </td>
                     </tr>
-                  ) : (
-                    filteredApps.map((app, idx) => {
-                      const appId = String(app.app_id || app.id || '');
-                      const decBefore = app.beforeDecision || '—';
-                      const decAfter = app.afterDecision || app.decision_after || '—';
-                      const diffCnt = Number(app.diffCount ?? app.diff_count ?? 0);
-
-                      return (
-                        <tr
-                          key={idx}
-                          onClick={() => handleOpenDossier(appId)}
-                          className="hover:bg-blue-50/40 cursor-pointer transition"
-                        >
-                          <td className="py-3 px-4 font-bold text-slate-900">{appId}</td>
-                          <td className="py-3 px-4">{decBefore}</td>
-                          <td className="py-3 px-4 font-bold text-slate-900">
-                            <span className="px-2 py-0.5 rounded text-[11px] bg-slate-100 border border-slate-200">
-                              {decAfter}
-                            </span>
-                          </td>
-                          <td className="py-3 px-4 text-center text-amber-700 font-bold">{diffCnt} шт.</td>
-                          <td className="py-3 px-4 text-right font-sans">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleOpenDossier(appId);
-                              }}
-                              className="bg-slate-900 hover:bg-blue-600 text-white px-3 py-1 rounded text-xs font-semibold transition cursor-pointer"
-                            >
-                              Открыть досье →
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
+                  ))}
+                  {filteredApps.length === 0 && (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-400 font-sans">
+                        Нет заявок под выбранные фильтры
+                      </td>
+                    </tr>
                   )}
                 </tbody>
               </table>
             </div>
+
+            {filteredApps.length > registryLimit && (
+              <div className="flex items-center justify-between text-xs text-slate-500">
+                <span>
+                  Показано {registryLimit} из {filteredApps.length}
+                </span>
+                <button
+                  onClick={() => setRegistryLimit((n) => n + APPS_PAGE)}
+                  className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-50 font-semibold cursor-pointer"
+                >
+                  Показать ещё {APPS_PAGE}
+                </button>
+              </div>
+            )}
           </div>
         </main>
       )}
 
-      {/* ==========================================
-          ВКЛАДКА 3: ЗАПУСК И ПАЙПЛАЙН
-      ========================================== */}
+      {/* ВКЛАДКА 3: ПАЙПЛАЙН */}
       {activeTab === 'run' && (
         <main className="flex-1 p-6 max-w-5xl w-full mx-auto space-y-6">
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
             <h3 className="text-sm font-bold text-slate-800">Запуск нового бэктеста</h3>
             <p className="text-xs text-slate-500">
-              Пользователь: <b>{currentUser.name} (ID: {currentUser.id})</b>
+              Аналитик: <b>{currentUser.name}</b> (логин: {currentUser.username}
+              {currentUser.backendId ? `, ID на бэке: ${currentUser.backendId}` : ''})
             </p>
+            <label className="block text-xs text-slate-600">
+              Метка прогона (runTag)
+              <input
+                type="text"
+                value={runTag}
+                onChange={(e) => setRunTag(e.target.value)}
+                className="mt-1 w-full border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500"
+              />
+            </label>
+            {availableRuns[0]?.config && (
+              <p className="text-[11px] text-slate-400 font-mono">
+                Остальная конфигурация берётся из последнего прогона: {availableRuns[0].config.datasetName}
+              </p>
+            )}
+
+            {pipelineError && (
+              <div className="bg-rose-50 border border-rose-200 text-rose-900 text-xs rounded-lg px-4 py-2 break-words">
+                <b>Не удалось запустить прогон:</b> {pipelineError}
+              </div>
+            )}
 
             <button
-              onClick={async () => {
-                setIsPipelineRunning(true);
-                setPipelineSeconds(0);
-                if (timerRef.current) clearInterval(timerRef.current);
-                timerRef.current = setInterval(() => setPipelineSeconds((s) => s + 1), 1000);
-
-                try {
-                  const res = await fetch(getApiUrl('/api/runs/'), {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ user_id: currentUser.id })
-                  });
-                  if (res.ok) {
-                    const data = await res.json();
-                    const newId = String(data.id || data.run_id);
-                    setRunId(newId);
-                    await fetchRunsList();
-                    await fetchReportData(newId);
-                  }
-                } catch {}
-
-                setTimeout(() => {
-                  clearInterval(timerRef.current);
-                  setIsPipelineRunning(false);
-                  setActiveTab('matrix');
-                }, 1500);
-              }}
-              disabled={isPipelineRunning}
-              className="w-full py-2.5 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm cursor-pointer disabled:opacity-50"
+              onClick={startRun}
+              disabled={isPipelineRunning || isFallback}
+              className="w-full py-2.5 rounded-xl text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition shadow-sm cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {isPipelineRunning ? `Выполняется расчет (${pipelineSeconds} с)...` : '▶ Запустить новый прогон пайплайна'}
+              {isPipelineRunning ? `Выполняется расчёт (${pipelineSeconds} с)...` : '▶ Запустить новый прогон пайплайна'}
             </button>
           </div>
 
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-3">
-            <h3 className="text-sm font-bold text-slate-800">Журнал этапов пайплайна</h3>
-            {(pipelineSteps.length > 0 ? pipelineSteps : [
-              { name: '1. Загрузка JSON-файлов датасета', status: 'done', time: 'Готово' },
-              { name: '2. Динамическая нормализация (Generic Flattener)', status: 'done', time: 'Готово' },
-              { name: '3. Вертикальный UNION и расчет различий (DuckDB)', status: 'done', time: 'Готово' },
-              { name: '4. Исполнение проверок риск-политики (Quality Gates)', status: 'done', time: 'Готово' }
-            ]).map((s, idx) => (
-              <div key={idx} className="flex justify-between items-center p-3 rounded-lg bg-slate-50 border border-slate-100 text-xs">
-                <span className="font-semibold text-slate-700">{s.name || `Этап ${idx + 1}`}</span>
-                <span className="text-[11px] font-mono text-slate-400">{s.time || s.status || 'OK'}</span>
-              </div>
-            ))}
+            <h3 className="text-sm font-bold text-slate-800">Журнал этапов пайплайна (прогон #{runId})</h3>
+            {isFallback ? (
+              <p className="text-xs text-slate-500">В демо-режиме данные об этапах недоступны.</p>
+            ) : pipelineSteps.length === 0 ? (
+              <p className="text-xs text-slate-500">Бэкенд не вернул этапы для этого прогона.</p>
+            ) : (
+              pipelineSteps.map((s) => (
+                <div key={s.id ?? s.name} className="p-3 rounded-lg bg-slate-50 border border-slate-100 text-xs space-y-1">
+                  <div className="flex justify-between items-center">
+                    <span className="font-semibold text-slate-700">{STEP_LABELS[s.name] || s.name}</span>
+                    <span className="flex items-center gap-2">
+                      {stepDuration(s) && <span className="text-[11px] font-mono text-slate-400">{stepDuration(s)}</span>}
+                      <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${stepBadge(s.status)}`}>{String(s.status || '—').toUpperCase()}</span>
+                    </span>
+                  </div>
+                  {s.code_ref && <div className="text-[11px] font-mono text-slate-500">код: {s.code_ref}</div>}
+                  {s.logs && <pre className="text-[11px] font-mono text-slate-500 whitespace-pre-wrap">{String(s.logs).slice(0, 500)}</pre>}
+                </div>
+              ))
+            )}
           </div>
         </main>
       )}
 
-      {/* ==========================================
-          ПОЛНОЕ И ЧЕСТНОЕ ДОСЬЕ ЗАЯВКИ
-      ========================================== */}
+      {/* ДОСЬЕ */}
       {activeDossierAppId && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-sm">
-          <div className="bg-white w-full max-w-3xl h-full shadow-2xl flex flex-col p-6 overflow-hidden">
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/40 backdrop-blur-sm" onClick={() => setActiveDossierAppId(null)}>
+          <div className="bg-white w-full max-w-4xl h-full shadow-2xl flex flex-col p-6 overflow-hidden" onClick={(e) => e.stopPropagation()}>
             <div className="flex justify-between items-start border-b border-slate-200 pb-4">
               <div>
-                <div className="flex items-center gap-2">
-                  <h3 className="font-bold text-lg text-slate-800 font-mono">Досье анкеты: {activeDossierAppId}</h3>
-                  <span className="text-xs bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded">
-                    Строк: {dossierRows.length}
-                  </span>
-                  {isDossierLoading && (
-                    <span className="text-xs text-blue-600 animate-pulse font-semibold">Запрос к FastAPI...</span>
-                  )}
-                </div>
-                <p className="text-xs text-slate-500 mt-1">
-                  Данные из <code>/api/reports/{runId}/applications/{activeDossierAppId}/diff</code>
-                </p>
+                <h3 className="font-bold text-lg text-slate-800 font-mono">Досье анкеты: {activeDossierAppId}</h3>
+                <span className="text-xs bg-amber-100 text-amber-800 font-bold px-2 py-0.5 rounded">
+                  Расхождений: {diffRowsCount} из {dossierRows.length}
+                </span>
+                {isDossierLoading && <span className="text-xs text-blue-600 animate-pulse font-semibold ml-2">Запрос к FastAPI...</span>}
               </div>
-              <button
-                onClick={() => setActiveDossierAppId(null)}
-                className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 cursor-pointer"
-              >
+              <button onClick={() => setActiveDossierAppId(null)} className="text-slate-400 hover:text-slate-700 text-lg font-bold p-1 cursor-pointer">
                 ✕
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto my-4 border border-slate-200 rounded-xl">
-              {dossierRows.length === 0 ? (
-                <div className="p-8 text-center text-slate-400 text-xs">
-                  Для анкеты {activeDossierAppId} нет зарегистрированных расхождений
-                </div>
-              ) : (
-                <table className="w-full text-left text-xs font-mono">
-                  <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold">
-                    <tr>
-                      <th className="py-2 px-3">Модуль (CLASS)</th>
-                      <th className="py-2 px-3">Параметр (KEY)</th>
-                      <th className="py-2 px-3 text-rose-700">VALUE_BEFORE</th>
-                      <th className="py-2 px-3 text-emerald-700">VALUE_AFTER</th>
-                      <th className="py-2 px-3 text-center">Статус</th>
-                      <th className="py-2 px-3">Комментарий</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100">
-                    {dossierRows.map((r, idx) => {
-                      const isDiff = Number(r.DIFF_FLAG ?? r.diff_flag) === 1;
-                      const comment = r.COMMENT || r.comment || '';
-
-                      return (
-                        <tr key={idx} className={isDiff ? 'bg-amber-50/50' : 'hover:bg-slate-50'}>
-                          <td className="py-2 px-3 font-sans text-slate-600">{r.CLASS || r.class_name || r.PREFIX || '—'}</td>
-                          <td className="py-2 px-3 font-bold text-slate-800">{r.ARRAY_KEY ? `${r.ARRAY_KEY}.${r.KEY || r.key}` : r.KEY || r.key}</td>
-                          <td className="py-2 px-3 text-rose-600">{String(r.VALUE_BEFORE ?? r.value_before ?? '—')}</td>
-                          <td className="py-2 px-3 text-emerald-600 font-bold">{String(r.VALUE_AFTER ?? r.value_after ?? '—')}</td>
-                          <td className="py-2 px-3 text-center font-sans">
-                            <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${
-                              isDiff ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'
-                            }`}>
-                              {isDiff ? 'DIFF=1' : 'MATCH'}
-                            </span>
-                          </td>
-                          <td className="py-2 px-3 font-sans text-slate-500 text-[11px]">{comment}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
+            <div className="flex flex-wrap items-center gap-2 py-3">
+              <input
+                type="text"
+                placeholder="Поиск по параметру, значению, комментарию..."
+                value={dossierSearch}
+                onChange={(e) => setDossierSearch(e.target.value)}
+                className="bg-slate-50 border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none w-72 focus:border-blue-500"
+              />
+              <button
+                onClick={() => setDossierOnlyDiff(!dossierOnlyDiff)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition cursor-pointer ${
+                  dossierOnlyDiff ? 'bg-amber-500 text-white border-amber-500' : 'bg-white text-slate-600 border-slate-300'
+                }`}
+              >
+                Только расхождения
+              </button>
             </div>
 
-            <div className="border-t border-slate-200 pt-3 flex justify-end">
-              <button
-                onClick={() => setActiveDossierAppId(null)}
-                className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer"
-              >
+            {dossierError && <div className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded px-3 py-1.5 mb-2">{dossierError}</div>}
+
+            <div className="flex-1 overflow-y-auto border border-slate-200 rounded-xl">
+              <table className="w-full text-left text-xs font-mono">
+                <thead className="bg-slate-50 text-slate-600 border-b border-slate-200 font-sans font-semibold sticky top-0">
+                  <tr>
+                    <th className="py-2 px-3">Модуль</th>
+                    <th className="py-2 px-3">Параметр</th>
+                    <th className="py-2 px-3 text-rose-700">Было</th>
+                    <th className="py-2 px-3 text-emerald-700">Стало</th>
+                    <th className="py-2 px-3">Бакет (до → после)</th>
+                    <th className="py-2 px-3 text-center">Статус</th>
+                    <th className="py-2 px-3">Комментарий</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {visibleDossierRows.map((r, idx) => {
+                    const diff = Number(r.DIFF_FLAG) === 1;
+                    const bBefore = r.ADJUSTED_BEFORE ?? r.adjusted_before;
+                    const bAfter = r.ADJUSTED_AFTER ?? r.adjusted_after;
+                    const sameBucket = !isEmpty(bBefore) && bBefore === bAfter;
+                    return (
+                      <tr key={idx} className={diff ? 'bg-amber-50/50' : 'hover:bg-slate-50'}>
+                        <td className="py-2 px-3 font-sans text-slate-600">{[r.PREFIX, r.CLASS].filter((x) => !isEmpty(x)).join(' › ') || '—'}</td>
+                        <td className="py-2 px-3 font-bold text-slate-800">{paramPath(r) || '(значение)'}</td>
+                        <td className="py-2 px-3 text-rose-600">
+                          <Cell v={r.VALUE_BEFORE} />
+                        </td>
+                        <td className="py-2 px-3 text-emerald-600 font-bold">
+                          <Cell v={r.VALUE_AFTER} />
+                        </td>
+                        <td className="py-2 px-3 text-slate-500">
+                          {isEmpty(bBefore) && isEmpty(bAfter) ? (
+                            <span className="text-slate-300">—</span>
+                          ) : sameBucket ? (
+                            <span title="бакет не изменился">{bBefore}</span>
+                          ) : (
+                            <span>
+                              <Cell v={bBefore} /> → <b className="text-slate-800">
+                                <Cell v={bAfter} />
+                              </b>
+                            </span>
+                          )}
+                        </td>
+                        <td className="py-2 px-3 text-center">
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${diff ? 'bg-amber-100 text-amber-800' : 'bg-slate-100 text-slate-500'}`}>
+                            {diff ? 'DIFF=1' : 'MATCH'}
+                          </span>
+                        </td>
+                        <td className="py-2 px-3 font-sans text-slate-500 text-[11px]">{r.COMMENT || r.comment || ''}</td>
+                      </tr>
+                    );
+                  })}
+                  {!isDossierLoading && visibleDossierRows.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="py-8 text-center text-slate-400 font-sans">
+                        {dossierRows.length === 0 ? 'Для этой анкеты нет данных.' : 'Нет строк под фильтр. Отключите «Только расхождения».'}
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="border-t border-slate-200 pt-3 mt-3 flex justify-end">
+              <button onClick={() => setActiveDossierAppId(null)} className="bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-xl text-xs font-semibold cursor-pointer">
                 Закрыть досье
               </button>
             </div>
@@ -1375,96 +1725,53 @@ export default function App() {
         </div>
       )}
 
-      {/* ==========================================
-          МОДАЛЬНОЕ ОКНО ДОБАВЛЕНИЯ АНАЛИТИКА
-      ========================================== */}
+      {/* МОДАЛКА АНАЛИТИКА */}
       {isAddUserModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
           <form
-            onSubmit={handleCreateAnalyst}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!newUserName.trim() || !newUserUsername.trim()) return;
+              const a = { id: String(Date.now()), name: newUserName.trim(), username: newUserUsername.trim(), role: newUserRole };
+              setAnalysts((list) => [...list, a]);
+              setCurrentUser(a);
+              setNewUserName('');
+              setNewUserUsername('');
+              setIsAddUserModalOpen(false);
+            }}
             className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200"
           >
             <h3 className="font-bold text-sm text-slate-800">Создать профиль аналитика</h3>
-            
-            <div className="text-xs space-y-3">
-              <div>
-                <label className="block text-slate-500 mb-1">ФИО / Отображаемое имя</label>
-                <input
-                  type="text"
-                  required
-                  placeholder="например: Аналитик 3 (Ольга)"
-                  value={newUserName}
-                  onChange={(e) => setNewUserName(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 outline-none focus:border-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-500 mb-1">Логин для API (username)</label>
-                <input
-                  type="text"
-                  placeholder="olga"
-                  value={newUserUsername}
-                  onChange={(e) => setNewUserUsername(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 font-mono outline-none focus:border-blue-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-500 mb-1">Должность / Роль</label>
-                <input
-                  type="text"
-                  placeholder="Risk Officer"
-                  value={newUserRole}
-                  onChange={(e) => setNewUserRole(e.target.value)}
-                  className="w-full border border-slate-300 rounded-lg p-2 outline-none focus:border-blue-500"
-                />
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setIsAddUserModalOpen(false)}
-                className="px-3 py-1.5 text-xs text-slate-600 cursor-pointer"
-              >
+            <input type="text" required placeholder="ФИО" value={newUserName} onChange={(e) => setNewUserName(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs" />
+            <input type="text" required placeholder="Логин (username на бэкенде)" value={newUserUsername} onChange={(e) => setNewUserUsername(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono" />
+            <input type="text" placeholder="Должность" value={newUserRole} onChange={(e) => setNewUserRole(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs" />
+            <div className="flex justify-end gap-2 pt-2 text-xs">
+              <button type="button" onClick={() => setIsAddUserModalOpen(false)} className="px-3 py-1.5 text-slate-600 cursor-pointer">
                 Отмена
               </button>
-              <button
-                type="submit"
-                className="px-4 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-blue-600 text-white rounded-lg transition cursor-pointer"
-              >
-                Создать профиль
+              <button type="submit" className="px-4 py-1.5 font-semibold bg-slate-900 text-white rounded-lg cursor-pointer">
+                Создать
               </button>
             </div>
           </form>
         </div>
       )}
 
-      {/* ==========================================
-          ПРОСМОТР КОДА ПРОВЕРОК ИЗ РЕПОЗИТОРИЯ
-      ========================================== */}
+      {/* МОДАЛКА КОДА */}
       {codeModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
           <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-2xl w-full max-w-3xl overflow-hidden flex flex-col text-white">
             <div className="px-5 py-3.5 border-b border-slate-800 flex justify-between items-center">
               <h3 className="font-bold text-sm text-slate-100">{codeModal.title}</h3>
-              <button onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })} className="text-slate-400 hover:text-white">✕</button>
+              <button onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })} className="text-slate-400 hover:text-white cursor-pointer">
+                ✕
+              </button>
             </div>
             <div className="p-3 bg-slate-950 font-mono text-xs">
-              <CodeMirror
-                value={codeModal.code}
-                height="320px"
-                theme="dark"
-                extensions={[python()]}
-                readOnly={true}
-              />
+              <CodeMirror value={codeModal.code} height="320px" theme="dark" extensions={[python()]} readOnly={true} />
             </div>
             <div className="px-5 py-3 border-t border-slate-800 flex justify-end bg-slate-900/80">
-              <button
-                onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })}
-                className="px-4 py-1.5 text-xs text-slate-300 hover:text-white bg-slate-800 rounded-lg cursor-pointer"
-              >
+              <button onClick={() => setCodeModal({ isOpen: false, title: '', code: '' })} className="px-4 py-1.5 text-xs text-slate-300 bg-slate-800 rounded-lg cursor-pointer">
                 Закрыть
               </button>
             </div>
