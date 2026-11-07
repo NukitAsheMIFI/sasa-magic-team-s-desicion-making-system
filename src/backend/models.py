@@ -67,4 +67,18 @@ class PivotFact(Base):
     diff_flag = Column(Integer)
     source = Column(String) # BEFORE (MASTER) / AFTER (BETA)
     cnt = Column(Integer)
+
+class CheckResult(Base):
+    __tablename__ = "check_results"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("runs.id"), index=True)
     
+    label = Column(String)       # Название проверки (LABEL)
+    source = Column(String)      # BEFORE / AFTER
+    argument = Column(String)    # Предмет проверки (ARGUMENT)
+    cnt = Column(Integer)        # Сколько заявок (CNT)
+    total = Column(Integer)      # База (TOTAL)
+    metric = Column(Float)       # Метрика (METRIC)
+    result = Column(String)      # PASS / FAIL
+    confidence = Column(String)  # HIGH / LOW
+    app_ids = Column(JSON)       # Список ID заявок (сохраняем как JSON)
