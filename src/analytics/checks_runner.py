@@ -12,9 +12,9 @@ import sqlite3
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "hackathon.db")
-CHECKS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "checks"))
-
+SRC_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
+DB_PATH = os.path.join(SRC_DIR, "backend", "hackathon.db")
+CHECKS_DIR = os.path.join(SRC_DIR, "checks")
 
 class MartAPI:
     """5 методов контракта: rows / count / app_ids / segments / total_apps."""
