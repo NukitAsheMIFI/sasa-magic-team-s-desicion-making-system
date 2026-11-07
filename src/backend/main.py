@@ -1,30 +1,46 @@
+import os
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from database import engine
-import models
+
+# Импорты моделей и роутеров бэкендера
+from database import engine, Base
 from api import runs, reports
 
-# Создаем таблицы
-models.Base.metadata.create_all(bind=engine)
+Base.metadata.create_all(bind=engine)
 
-app = FastAPI(
-    title="Strategy Diff Studio API",
-    description="Backend for testing decision engine strategy changes",
-    version="0.1.0"
-)
-
+app = FastAPI(title="SPR Comparison System")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Для MVP разрешаем всё
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
-app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
+# Подключение роутов API
+app.include_router(runs.router, prefix="/api")
+app.include_router(reports.router, prefix="/api")
 
-@app.get("/")
-def read_root():
-    return {"status": "ok", "message": "Strategy Diff API is running"}
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "message": "Бэкенд запущен"}
+
+# ==========================================
+# Раздача собранного React-фронтенда
+# ==========================================
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+
+if os.path.exists(STATIC_DIR):
+    # Раздаем ассеты фронтенда (js, css, картинки)
+    app.mount("/assets", StaticFiles(directory=os.path.join(STATIC_DIR, "assets")), name="assets")
+
+    # Любой другой путь отдаем в index.html (для поддержки React Router)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        file_path = os.path.join(STATIC_DIR, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(STATIC_DIR, "index.html"))

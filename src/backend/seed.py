@@ -1,5 +1,10 @@
 from database import SessionLocal
+#строчка написана интегратором
+from database import engine, Base
 import models
+
+#строчка написана интегратором
+Base.metadata.create_all(bind=engine)
 
 def create_mock_user():
     db = SessionLocal()
