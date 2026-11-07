@@ -32,16 +32,39 @@ class RunStep(Base):
     run = relationship("Run", back_populates="steps")
 
 class MartRow(Base):
-    """Универсальная строка витрины. Бэкенд не знает, что такое PATH, он просто хранит строки."""
     __tablename__ = "mart_rows"
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("runs.id"), index=True)
     app_id = Column(String, index=True)
-    path = Column(String, index=True) # Например: characteristics.score_okb
+    path = Column(String, index=True)
     array_key = Column(String, nullable=True, index=True)
+    
+    prefix = Column(String, index=True)
+    class_name = Column(String, index=True)
+    suffix = Column(String, nullable=True)
+    key = Column(String, index=True)
+    
     value_before = Column(String, nullable=True)
     value_after = Column(String, nullable=True)
+    adjusted_before = Column(String, nullable=True)
+    adjusted_after = Column(String, nullable=True)
+    
     diff_flag = Column(Integer, default=0, index=True)
-    change_type = Column(String, index=True) # SAME, VALUE_CHANGED, ATTRIBUTE_NEW, ATTRIBUTE_LOST
+    change_type = Column(String, index=True)
     
     run = relationship("Run", back_populates="mart_rows")
+
+class PivotFact(Base):
+    __tablename__ = "pivot_facts"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("runs.id"), index=True)
+    prefix = Column(String, index=True)
+    class_name = Column(String, index=True)
+    suffix = Column(String, nullable=True)
+    array_key = Column(String, nullable=True)
+    key = Column(String, index=True)
+    value_adjusted = Column(String)
+    diff_flag = Column(Integer)
+    source = Column(String) # BEFORE (MASTER) / AFTER (BETA)
+    cnt = Column(Integer)
+    

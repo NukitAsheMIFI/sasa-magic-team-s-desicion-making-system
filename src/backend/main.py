@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import engine
 import models
-from api import runs
+from api import runs, reports
 
 # Создаем таблицы
 models.Base.metadata.create_all(bind=engine)
@@ -13,6 +13,7 @@ app = FastAPI(
     version="0.1.0"
 )
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # Для MVP разрешаем всё
@@ -22,6 +23,7 @@ app.add_middleware(
 )
 
 app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
+app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 
 @app.get("/")
 def read_root():
