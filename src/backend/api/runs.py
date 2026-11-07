@@ -150,7 +150,35 @@ def run_pipeline(run_id: int, config: dict):
                 print("Факты для сводной таблицы успешно сгенерированы!")
 
             elif step_name == "checks":
-                pass # Пока пропускаем
+                # ВРЕМЕННО ОТКЛЮЧЕНО, ПОКА АНАЛИТИК НЕ ДОДЕЛАЕТ СВОЙ КОД
+                print("Шаг проверок пропущен (временно отключен на бэкенде).")
+                # from services.checks_runner import run_all_checks
+                # print("Запуск автоматических проверок...")
+                # 
+                # current_file = Path(__file__).resolve()
+                # src_dir = current_file.parent.parent.parent
+                # checks_dir = src_dir / "checks" 
+                # 
+                # check_results = run_all_checks(db, run_id, str(checks_dir))
+                # 
+                # checks_to_insert = []
+                # for r in check_results:
+                #     checks_to_insert.append(models.CheckResult(
+                #         run_id=run_id,
+                #         label=r.get("LABEL", ""),
+                #         source=r.get("SOURCE", ""),
+                #         argument=r.get("ARGUMENT", ""),
+                #         cnt=r.get("CNT", 0),
+                #         total=r.get("TOTAL", 0),
+                #         metric=r.get("METRIC", 0.0),
+                #         result=r.get("RESULT", ""),
+                #         confidence=r.get("CONFIDENCE", ""),
+                #         app_ids=r.get("APP_IDS", [])
+                #     ))
+                # 
+                # db.bulk_save_objects(checks_to_insert)
+                # db.commit()
+                # print(f"Проверки завершены. Сохранено строк: {len(checks_to_insert)}")
 
             step.status = "done"
             step.finished_at = datetime.datetime.now().isoformat()
@@ -197,3 +225,25 @@ def get_run_mart(run_id: int, db: Session = Depends(get_db)):
     """Эндпоинт для получения данных сводной таблицы (mock)"""
     rows = db.query(models.MartRow).filter(models.MartRow.run_id == run_id).all()
     return rows
+
+@router.get("/")
+def get_all_runs(db: Session = Depends(get_db)):
+    """Возвращает список всех запусков для экрана истории"""
+    runs = db.query(models.Run).order_by(models.Run.id.desc()).all()
+    return runs
+
+@router.get("/")
+def get_all_runs(db: Session = Depends(get_db)):
+    runs = db.query(models.Run).order_by(models.Run.id.desc()).all()
+    # Подмешиваем имя пользователя к каждому запуску
+    result = []
+    for r in runs:
+        user = db.query(models.User).filter(models.User.id == r.user_id).first()
+        result.append({
+            "id": r.id,
+            "status": r.status,
+            "created_at": r.created_at,
+            "user_id": r.user_id,
+            "username": user.username if user else "Unknown"
+        })
+    return result

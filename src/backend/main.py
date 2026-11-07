@@ -7,6 +7,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Импорты моделей и роутеров бэкендера
 from database import engine, Base
 from api import runs, reports
+from database import engine
+import models
+from api import runs, reports, auth
 
 Base.metadata.create_all(bind=engine)
 
@@ -23,6 +26,9 @@ app.add_middleware(
 # Подключение роутов API
 app.include_router(runs.router, prefix="/api")
 app.include_router(reports.router, prefix="/api")
+app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
+app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 
 @app.get("/api/health")
 def health_check():
