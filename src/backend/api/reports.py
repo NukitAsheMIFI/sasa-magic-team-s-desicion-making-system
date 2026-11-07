@@ -124,3 +124,43 @@ def get_applications_registry(
         })
         
     return result
+@router.get("/{run_id}/applications")
+def get_applications(run_id: int, db: Session = Depends(get_db)):
+    """
+    Возвращает реестр заявок с изменениями для таблицы.
+    """
+    # 1. Группируем по APP_ID и считаем количество изменений (diff_flag=1)
+    results = db.query(
+        models.MartRow.app_id,
+        func.count(models.MartRow.id).label("diff_count")
+    ).filter(
+        models.MartRow.run_id == run_id,
+        models.MartRow.diff_flag == 1
+    ).group_by(models.MartRow.app_id).limit(100).all()
+
+    if not results:
+        return []
+
+    app_ids = [r.app_id for r in results]
+
+    # 2. Достаем решение AFTER (для поля decision_after)
+    # ВАЖНО: Убедись, что путь 'decisionResult.decision' совпадает с тем, 
+    # что пишет аналитик в normalize.py. Если он назвал его иначе (например, 'decision'), поменяй здесь!
+    decisions = db.query(models.MartRow.app_id, models.MartRow.value_after).filter(
+        models.MartRow.run_id == run_id,
+        models.MartRow.app_id.in_(app_ids),
+        models.MartRow.path == "decisionResult.decision" 
+    ).all()
+    
+    # Делаем словарь для быстрого поиска: { 'I32554354': 'REJECT' }
+    decision_map = {d.app_id: d.value_after for d in decisions}
+
+    # 3. Собираем ответ в формате, который просил фронт
+    return [
+        {
+            "app_id": r.app_id,
+            "diff_count": r.diff_count,
+            "decision_after": decision_map.get(r.app_id, "UNKNOWN")
+        }
+        for r in results
+    ]
