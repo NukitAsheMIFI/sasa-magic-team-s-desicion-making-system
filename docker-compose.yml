@@ -13,4 +13,4 @@ services:
       # Монтирование пользовательских скриптов и проверок
       - ./src/scripts:/app/src/scripts
       - ./src/checks:/app/src/checks
-    #restart: unless-stopped
+    restart: unless-stopped

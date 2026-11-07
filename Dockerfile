@@ -18,7 +18,8 @@ RUN npm run build
 FROM python:3.11-slim AS final
 
 WORKDIR /app
-ENV PYTHONPATH="/app/src/backend:/app"
+ENV PYTHONPATH="/app/src/data:/app/src/analytics:/app/src/checks:/app/src/backend:/app/src:/app"
+ENV PYTHONUNBUFFERED=1
 
 # Системные пакеты
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,8 +32,12 @@ RUN pip install --no-cache-dir -r ./src/backend/requirements.txt
 
 # Копируем исходники бэкенда, проверок и скриптов
 COPY src/backend/ ./src/backend/
+# Создаем симлинк, чтобы относительный путь user_scripts/ был доступен прямо из /app
+RUN ln -s /app/src/backend/user_scripts /app/user_scripts
 COPY src/checks/ ./src/checks/
 COPY src/data/ ./src/data/
+COPY src/analytics/ ./src/analytics/
+COPY src/scripts/ ./src/scripts/
 
 # Копируем собранный фронтенд в статику бэкенда
 COPY --from=frontend-builder /app/frontend/dist ./src/backend/static
