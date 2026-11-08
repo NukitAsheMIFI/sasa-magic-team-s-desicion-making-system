@@ -7,6 +7,7 @@ from sqlalchemy import func, literal
 from database import SQLALCHEMY_DATABASE_URL
 from database import get_db
 import models
+from pydantic import BaseModel
 
 # Инициализация роутера
 router = APIRouter()
