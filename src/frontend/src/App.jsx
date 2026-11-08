@@ -44,15 +44,8 @@ const INITIAL_ANALYSTS = [
 // ----------------------------------------------------
 // Утилиты
 // ----------------------------------------------------
-const api = (path) => {
-  let base = '';
-  try {
-    base = (localStorage.getItem('spr_backend_url') || '').trim().replace(/\/+$/, '');
-  } catch {
-    /* localStorage недоступен */
-  }
-  return base ? `${base}${path}` : path;
-};
+// Только относительные пути (/api/...): работает и через Vite Proxy, и в Docker
+const api = (path) => path;
 
 const getJson = async (path, signal) => {
   const res = await fetch(api(path), { signal });
@@ -196,6 +189,10 @@ export default function App() {
   const [isPipelineRunning, setIsPipelineRunning] = useState(false);
   const [pipelineSeconds, setPipelineSeconds] = useState(0);
   const [pipelineError, setPipelineError] = useState(null);
+  const [aiSummary, setAiSummary] = useState(null);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState(null);
+  const aiReqRef = useRef(0);
   const [runTag, setRunTag] = useState('Сравнение MASTER vs BETA');
   const timerRef = useRef(null);
   const aliveRef = useRef(true);
@@ -218,6 +215,7 @@ export default function App() {
   const [sortMode, setSortMode] = useState('impact');
   const [expandedModules, setExpandedModules] = useState({});
   const [rowLimits, setRowLimits] = useState({});
+  const [expandedChecks, setExpandedChecks] = useState({});
 
   // Реестр
   const [registryStatusFilter, setRegistryStatusFilter] = useState('ALL');
@@ -235,12 +233,41 @@ export default function App() {
 
   const [codeModal, setCodeModal] = useState({ isOpen: false, title: '', code: '' });
 
+  // Пользовательские Quality Gates (бэкенд пока не умеет их сохранять и запускать, поэтому хранятся локально)
+  const CUSTOM_TEMPLATE = `# Проверка получает pandas DataFrame витрины фактов (pivot facts)
+# и должна вернуть список срезов: label, argument, cnt, total, result
+def run(df):
+    left = df[(df["DIFF_FLAG"] == "1") & (df["SOURCE"].str.startswith("BEFORE"))]
+    cnt = len(left)
+    return [{"label": "Моя проверка", "argument": "", "cnt": cnt, "total": len(df), "result": "FAIL" if cnt else "PASS"}]
+`;
+  const [customChecks, setCustomChecks] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('spr_custom_checks_v1') || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [isAddCheckOpen, setIsAddCheckOpen] = useState(false);
+  const [ccName, setCcName] = useState('');
+  const [ccModule, setCcModule] = useState('');
+  const [ccThreshold, setCcThreshold] = useState('');
+  const [ccCode, setCcCode] = useState(CUSTOM_TEMPLATE);
+  useEffect(() => {
+    try {
+      localStorage.setItem('spr_custom_checks_v1', JSON.stringify(customChecks));
+    } catch {
+      /* localStorage недоступен */
+    }
+  }, [customChecks]);
+
   // Esc закрывает модалки
   useEffect(() => {
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
       setCodeModal((m) => (m.isOpen ? { isOpen: false, title: '', code: '' } : m));
       setIsAddUserModalOpen(false);
+      setIsAddCheckOpen(false);
       setActiveDossierAppId(null);
     };
     window.addEventListener('keydown', onKey);
@@ -440,13 +467,22 @@ export default function App() {
   // ----------------------------------------------------
   const applications = useMemo(() => {
     const clean = (v) => (v && String(v).toUpperCase() !== 'UNKNOWN' ? String(v).toUpperCase() : '—');
+    // ищем поле решения по имени без учёта регистра и разделителей: beforeDecision / before_decision / decision_before / master_decision ...
+    const pick = (app, side) => {
+      const names = side === 'before' ? ['before', 'master'] : ['after', 'beta'];
+      for (const k of Object.keys(app)) {
+        const low = k.toLowerCase().replace(/[^a-z]/g, '');
+        if (low.includes('decision') && names.some((n) => low.includes(n))) return app[k];
+      }
+      return null;
+    };
     return rawApplications.map((app) => {
       const rawId = normId(app.app_id ?? app.id);
       return {
         app_id: rawId,
         id: `APP-${rawId}`,
-        beforeDecision: clean(app.beforeDecision ?? app.before_decision ?? app.decision_before),
-        afterDecision: clean(app.afterDecision ?? app.after_decision ?? app.decision_after),
+        beforeDecision: clean(pick(app, 'before')),
+        afterDecision: clean(pick(app, 'after')),
         diffCount: Number(app.diffCount ?? app.diff_count ?? 0)
       };
     });
@@ -612,6 +648,32 @@ export default function App() {
   );
   const checksAreEstimates = rawDbChecks.length === 0;
 
+  // Бэкенд отдаёт много срезов на одну проверку (по продукту, по пути атрибута).
+  // Группируем по названию: проверка = FAIL, если упал хотя бы один срез.
+  const checkGroups = useMemo(() => {
+    const map = new Map();
+    checksResults.forEach((c) => {
+      if (!map.has(c.LABEL)) map.set(c.LABEL, { label: c.LABEL, checkId: c.CHECK_ID, items: [] });
+      const g = map.get(c.LABEL);
+      g.items.push(c);
+      if (!g.checkId && c.CHECK_ID) g.checkId = c.CHECK_ID;
+    });
+    return [...map.values()].map((g) => {
+      const items = [...g.items].sort((a, b) => b.CNT - a.CNT);
+      const fails = items.filter((i) => i.RESULT === 'FAIL').length;
+      const metrics = items.map((i) => Number(i.METRIC)).filter((m) => Number.isFinite(m));
+      return {
+        ...g,
+        items,
+        fails,
+        result: fails > 0 ? 'FAIL' : 'PASS',
+        estimate: items.some((i) => i.ESTIMATE),
+        maxCnt: Math.max(...items.map((i) => i.CNT)),
+        maxMetric: metrics.length ? Math.max(...metrics) : null
+      };
+    });
+  }, [checksResults]);
+
   // Waterfall
   const activeWaterfallRow = useMemo(() => {
     if (decisionRows.length === 0) return null;
@@ -728,9 +790,52 @@ export default function App() {
     return <span className="inline-flex items-center px-2 py-0.5 rounded text-[11px] text-slate-400">Стабильно (MATCH)</span>;
   };
 
+  // Сброс резюме при смене прогона
+  useEffect(() => {
+    aiReqRef.current += 1;
+    setAiSummary(null);
+    setAiError(null);
+    setAiLoading(false);
+  }, [runId]);
+
+  const generateAiSummary = async () => {
+    if (!runId || aiLoading) return;
+    const req = ++aiReqRef.current;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      // минимум 1 секунда индикатора, чтобы анимация не мигала
+      const [data] = await Promise.all([getJson(`/api/reports/${runId}/ai-summary`), sleep(1000)]);
+      if (req !== aiReqRef.current) return;
+      let text = data;
+      if (data && typeof data === 'object') {
+        text = data.summary ?? data.text ?? data.content ?? data.message ?? data.result ?? data.ai_summary ?? JSON.stringify(data, null, 2);
+      }
+      setAiSummary(String(text ?? '').trim() || 'Бэкенд вернул пустое резюме.');
+    } catch (e) {
+      if (req !== aiReqRef.current) return;
+      setAiError(e.message || String(e));
+    } finally {
+      if (req === aiReqRef.current) setAiLoading(false);
+    }
+  };
+
   const handleInvestigateCheck = (check) => {
-    if (!check.APP_IDS || check.APP_IDS.length === 0) return;
-    setActiveInvestigateCheck({ label: check.LABEL, argument: check.ARGUMENT, appIds: check.APP_IDS, cnt: check.CNT });
+    // Для проверки падения Approval Rate список считаем сами: APPROVE → не APPROVE (бэк отдаёт максимум первые N)
+    const isAr = check.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(check.LABEL || '');
+    let ids = check.APP_IDS || [];
+    let cnt = check.CNT;
+    if (isAr && hasDecisions) {
+      const failed = applications
+        .filter((a) => a.beforeDecision === 'APPROVE' && a.afterDecision !== 'APPROVE')
+        .map((a) => a.app_id);
+      if (failed.length) {
+        ids = failed;
+        cnt = failed.length;
+      }
+    }
+    if (ids.length === 0) return;
+    setActiveInvestigateCheck({ label: check.LABEL, argument: check.ARGUMENT, appIds: ids, cnt });
     setRegistryStatusFilter('ALL');
     setSelectedPivotFilter(null);
     setRegistryLimit(APPS_PAGE);
@@ -854,6 +959,39 @@ export default function App() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  // Основной экспорт: готовый файл с бэкенда (/export.html). Если эндпоинта нет или он отвечает ошибкой,
+  // скачивается локально собранный отчёт (handleExportHtml).
+  const [exporting, setExporting] = useState(false);
+  const [exportNote, setExportNote] = useState(null);
+  const handleDownloadReport = async () => {
+    if (!runId) return;
+    if (apiStatus !== 'connected') {
+      handleExportHtml();
+      return;
+    }
+    setExporting(true);
+    setExportNote(null);
+    try {
+      const res = await fetch(api(`/api/reports/${runId}/export.html`));
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `SPR_Audit_Report_Run_${runId}.html`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      setExportNote(`Отчёт с бэкенда недоступен (${e.message}), скачан локальный вариант`);
+      handleExportHtml();
+      setTimeout(() => setExportNote(null), 6000);
+    } finally {
+      setExporting(false);
+    }
+  };
+
   // ----------------------------------------------------
   // Шаги пайплайна для отображения
   // ----------------------------------------------------
@@ -868,6 +1006,70 @@ export default function App() {
     if (TERMINAL_FAIL.includes(v)) return 'bg-rose-100 text-rose-800';
     if (v === 'running') return 'bg-blue-100 text-blue-800 animate-pulse';
     return 'bg-slate-100 text-slate-600';
+  };
+
+  // Одна строка таблицы проверок (обычная или вложенный срез внутри группы)
+  const renderCheckRow = (c, key, nested) => {
+    const hasAppIds = c.APP_IDS.length > 0 || (hasDecisions && c.RESULT === 'FAIL' && (c.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(c.LABEL || '')));
+    const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID];
+    return (
+      <tr key={key} className={nested ? 'bg-slate-50/70' : 'hover:bg-slate-50 transition'}>
+        <td className="py-2.5 px-4 font-semibold text-slate-800">
+          {nested ? (
+            <span className="pl-5 text-slate-400 font-normal">↳ срез</span>
+          ) : (
+            <>
+              {c.LABEL}
+              {c.ESTIMATE && <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">оценка</span>}
+              {c.CONFIDENCE === 'LOW' && (
+                <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600" title="Мало анкет, результат ненадёжен">
+                  LOW
+                </span>
+              )}
+            </>
+          )}
+        </td>
+        <td className="py-2.5 px-4 font-mono text-slate-600">
+          <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px] break-all">{c.ARGUMENT || '—'}</span>
+        </td>
+        <td className="py-2.5 px-4 text-center font-mono font-bold">
+          {hasAppIds ? (
+            <button
+              onClick={() => handleInvestigateCheck(c)}
+              className="px-2.5 py-1 rounded bg-blue-50 hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-300 font-bold transition cursor-pointer"
+              title="Открыть эти анкеты в реестре"
+            >
+              🔍 {c.CNT} анкет ➔
+            </button>
+          ) : (
+            <span className="text-slate-800">{c.CNT}</span>
+          )}
+        </td>
+        <td className="py-2.5 px-4 text-center font-mono text-slate-700">{c.METRIC === null ? '—' : fmtPct(c.METRIC)}</td>
+        <td className="py-2.5 px-4 text-center">
+          <span
+            className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+              c.RESULT === 'PASS'
+                ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                : 'bg-rose-100 text-rose-800 border border-rose-200'
+            }`}
+          >
+            {c.RESULT || '—'}
+          </span>
+        </td>
+        <td className="py-2.5 px-4 text-right">
+          {!nested && (
+            <button
+              disabled={!code}
+              onClick={() => setCodeModal({ isOpen: true, title: c.LABEL, code })}
+              className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Код ↗
+            </button>
+          )}
+        </td>
+      </tr>
+    );
   };
 
   const runOptions = availableRuns.length > 0 ? availableRuns : [{ id: 'demo', status: 'demo', config: { runTag: 'демо-данные' } }];
@@ -950,17 +1152,25 @@ export default function App() {
             </select>
           </div>
           <button
+            onClick={() => setIsAddCheckOpen(true)}
+            className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
+          >
+            + Проверка
+          </button>
+          <button
             onClick={() => setIsAddUserModalOpen(true)}
             className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
           >
             + Аналитик
           </button>
           <button
-            onClick={handleExportHtml}
-            className="px-3 py-1 rounded-lg font-semibold bg-emerald-600 hover:bg-emerald-700 text-white transition shadow-sm cursor-pointer"
+            onClick={handleDownloadReport}
+            disabled={exporting || !runId}
+            className="px-3 py-1 rounded-lg font-semibold bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 text-white transition shadow-sm cursor-pointer"
           >
-            ⬇ Скачать HTML
+            {exporting ? 'Готовим…' : '⬇ Скачать HTML'}
           </button>
+          {exportNote && <span className="text-[11px] text-amber-700 max-w-xs">{exportNote}</span>}
         </div>
       </header>
 
@@ -1000,6 +1210,49 @@ export default function App() {
             </div>
           </div>
 
+          {/* AI Executive Summary */}
+          <section className="bg-white rounded-xl border border-indigo-200 shadow-sm overflow-hidden">
+            <div className="px-5 py-3.5 bg-indigo-50/60 border-b border-indigo-100 flex flex-wrap justify-between items-center gap-3">
+              <div className="flex items-center gap-2">
+                <svg className="w-5 h-5 text-indigo-600" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                  <path d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9L12 2zM19 14l.9 2.6 2.6.9-2.6.9L19 21l-.9-2.6-2.6-.9 2.6-.9L19 14zM5 15l.7 2 2 .7-2 .7L5 20l-.7-2-2-.7 2-.7L5 15z" />
+                </svg>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-800">AI Executive Summary</h3>
+                  <p className="text-[11px] text-slate-500">Краткое резюме по прогону #{runId}</p>
+                </div>
+              </div>
+              <button
+                onClick={generateAiSummary}
+                disabled={aiLoading || !runId || apiStatus !== 'connected'}
+                title={apiStatus !== 'connected' ? 'Нужно подключение к бэкенду' : undefined}
+                className="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white text-xs font-bold transition cursor-pointer"
+              >
+                {aiLoading ? 'Генерация…' : aiSummary ? 'Сгенерировать заново' : 'Сгенерировать резюме'}
+              </button>
+            </div>
+            {(aiLoading || aiSummary || aiError) && (
+              <div className="p-5" aria-live="polite">
+                {aiLoading && (
+                  <div className="flex items-center gap-3 text-sm text-indigo-800">
+                    <span className="inline-block w-4 h-4 rounded-full border-2 border-indigo-300 border-t-indigo-600 animate-spin" />
+                    ИИ анализирует {pivotFacts.length.toLocaleString('ru-RU')} строк...
+                  </div>
+                )}
+                {!aiLoading && aiError && (
+                  <div className="text-sm text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-4 py-3">
+                    Не удалось получить резюме: {aiError}
+                  </div>
+                )}
+                {!aiLoading && !aiError && aiSummary && (
+                  <div className="text-sm leading-relaxed text-slate-800 whitespace-pre-wrap bg-indigo-50/40 border border-indigo-100 rounded-lg px-4 py-3">
+                    {aiSummary}
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
           {!isLoadingApi && pivotFacts.length === 0 && !loadError && (
             <div className="bg-white border border-slate-200 rounded-xl p-6 text-sm text-slate-500 text-center">
               Для прогона #{runId} нет данных витрины. Возможно, расчёт ещё не завершён.
@@ -1016,8 +1269,8 @@ export default function App() {
                 </p>
               </div>
               <div className="flex gap-2 text-xs font-bold">
-                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">PASS: {checksResults.filter((c) => c.RESULT === 'PASS').length}</span>
-                <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800">FAIL: {checksResults.filter((c) => c.RESULT === 'FAIL').length}</span>
+                <span className="px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">PASS: {checkGroups.filter((g) => g.result === 'PASS').length}</span>
+                <span className="px-2 py-0.5 rounded bg-rose-100 text-rose-800">FAIL: {checkGroups.filter((g) => g.result === 'FAIL').length}</span>
               </div>
             </div>
 
@@ -1045,58 +1298,53 @@ export default function App() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {checksResults.map((c, idx) => {
-                      const hasAppIds = c.APP_IDS.length > 0;
-                      const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID];
+                    {checkGroups.map((g) => {
+                      if (g.items.length === 1) return renderCheckRow(g.items[0], g.label, false);
+                      const open = !!expandedChecks[g.label];
+                      const code = REPO_PYTHON_SCRIPTS[g.checkId];
                       return (
-                        <tr key={idx} className="hover:bg-slate-50 transition">
-                          <td className="py-2.5 px-4 font-semibold text-slate-800">
-                            {c.LABEL}
-                            {c.ESTIMATE && <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">оценка</span>}
-                            {c.CONFIDENCE === 'LOW' && (
-                              <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600" title="Мало анкет, результат ненадёжен">
-                                LOW
+                        <React.Fragment key={g.label}>
+                          <tr
+                            onClick={() => setExpandedChecks((p) => ({ ...p, [g.label]: !p[g.label] }))}
+                            className="hover:bg-slate-50 transition cursor-pointer"
+                          >
+                            <td className="py-2.5 px-4 font-semibold text-slate-800">
+                              <span className="text-slate-400 mr-1.5">{open ? '▼' : '▶'}</span>
+                              {g.label}
+                              <span className="ml-2 text-[10px] font-normal text-slate-500">
+                                {g.items.length} срезов{g.fails > 0 ? `, FAIL: ${g.fails}` : ''}
                               </span>
-                            )}
-                          </td>
-                          <td className="py-2.5 px-4 font-mono text-slate-600">
-                            <span className="bg-slate-100 px-2 py-0.5 rounded text-[11px]">{c.ARGUMENT || '—'}</span>
-                          </td>
-                          <td className="py-2.5 px-4 text-center font-mono font-bold">
-                            {hasAppIds ? (
-                              <button
-                                onClick={() => handleInvestigateCheck(c)}
-                                className="px-2.5 py-1 rounded bg-blue-50 hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-300 font-bold transition cursor-pointer"
-                                title="Открыть эти анкеты в реестре"
+                              {g.estimate && <span className="ml-2 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">оценка</span>}
+                            </td>
+                            <td className="py-2.5 px-4 text-slate-400">{open ? 'свернуть' : 'развернуть'}</td>
+                            <td className="py-2.5 px-4 text-center font-mono text-slate-700">до {g.maxCnt}</td>
+                            <td className="py-2.5 px-4 text-center font-mono text-slate-700">{g.maxMetric === null ? '—' : `до ${fmtPct(g.maxMetric)}`}</td>
+                            <td className="py-2.5 px-4 text-center">
+                              <span
+                                className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  g.result === 'PASS'
+                                    ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                    : 'bg-rose-100 text-rose-800 border border-rose-200'
+                                }`}
                               >
-                                🔍 {c.CNT} анкет ➔
+                                {g.result}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-4 text-right">
+                              <button
+                                disabled={!code}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setCodeModal({ isOpen: true, title: g.label, code });
+                                }}
+                                className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                              >
+                                Код ↗
                               </button>
-                            ) : (
-                              <span className="text-slate-800">{c.CNT}</span>
-                            )}
-                          </td>
-                          <td className="py-2.5 px-4 text-center font-mono text-slate-700">{c.METRIC === null ? '—' : fmtPct(c.METRIC)}</td>
-                          <td className="py-2.5 px-4 text-center">
-                            <span
-                              className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                c.RESULT === 'PASS'
-                                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                                  : 'bg-rose-100 text-rose-800 border border-rose-200'
-                              }`}
-                            >
-                              {c.RESULT || '—'}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-4 text-right">
-                            <button
-                              disabled={!code}
-                              onClick={() => setCodeModal({ isOpen: true, title: c.LABEL, code })}
-                              className="text-[11px] bg-slate-100 hover:bg-slate-200 text-slate-700 px-2 py-1 rounded font-semibold transition cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                            >
-                              Код ↗
-                            </button>
-                          </td>
-                        </tr>
+                            </td>
+                          </tr>
+                          {open && g.items.map((c, i) => renderCheckRow(c, `${g.label}-${i}`, true))}
+                        </React.Fragment>
                       );
                     })}
                   </tbody>
@@ -1104,6 +1352,52 @@ export default function App() {
               </div>
             )}
           </div>
+
+          {customChecks.length > 0 && (
+            <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+              <div className="px-5 py-3 bg-slate-50 border-b border-slate-200">
+                <h3 className="text-sm font-bold text-slate-800">Пользовательские проверки</h3>
+                <p className="text-[11px] text-slate-500">Сохранены в браузере. Бэкенд их пока не запускает, статус «Не запускалась».</p>
+              </div>
+              <table className="w-full text-xs text-left">
+                <thead className="text-[11px] uppercase text-slate-500 bg-white border-b border-slate-100">
+                  <tr>
+                    <th className="py-2 px-4">Название</th>
+                    <th className="py-2 px-4">Модуль</th>
+                    <th className="py-2 px-4 text-center">Порог</th>
+                    <th className="py-2 px-4 text-center">Статус</th>
+                    <th className="py-2 px-4 text-right">Действия</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {customChecks.map((c) => (
+                    <tr key={c.id}>
+                      <td className="py-2.5 px-4 font-semibold text-slate-800">{c.name}</td>
+                      <td className="py-2.5 px-4 font-mono text-slate-600">{c.module || '—'}</td>
+                      <td className="py-2.5 px-4 text-center font-mono">{c.threshold || '—'}</td>
+                      <td className="py-2.5 px-4 text-center">
+                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[11px]">Не запускалась</span>
+                      </td>
+                      <td className="py-2.5 px-4 text-right space-x-2">
+                        <button
+                          onClick={() => setCodeModal({ isOpen: true, title: c.name, code: c.code })}
+                          className="px-2 py-1 rounded bg-slate-900 text-white text-[11px] font-semibold cursor-pointer"
+                        >
+                          Код
+                        </button>
+                        <button
+                          onClick={() => setCustomChecks((list) => list.filter((x) => x.id !== c.id))}
+                          className="px-2 py-1 rounded bg-white border border-rose-300 text-rose-700 text-[11px] font-semibold cursor-pointer"
+                        >
+                          Удалить
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
 
           {/* Waterfall */}
           {activeWaterfallRow && (
@@ -1413,6 +1707,13 @@ export default function App() {
                 >
                   ✕ Сбросить фильтр расследования
                 </button>
+              </div>
+            )}
+
+            {rawApplications.length > 0 && applications.some((a) => a.beforeDecision === '—') && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg px-4 py-2 text-xs text-amber-900">
+                У {applications.filter((a) => a.beforeDecision === '—').length} из {applications.length} заявок нет решения MASTER. Поля в ответе
+                /applications: <span className="font-mono">{Object.keys(rawApplications[0]).join(', ')}</span>
               </div>
             )}
 
@@ -1750,6 +2051,88 @@ export default function App() {
                 Отмена
               </button>
               <button type="submit" className="px-4 py-1.5 font-semibold bg-slate-900 text-white rounded-lg cursor-pointer">
+                Создать
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* МОДАЛКА: НОВАЯ ПРОВЕРКА */}
+      {isAddCheckOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!ccName.trim()) return;
+              setCustomChecks((list) => [
+                ...list,
+                { id: String(Date.now()), name: ccName.trim(), module: ccModule.trim(), threshold: ccThreshold.trim(), code: ccCode }
+              ]);
+              setCcName('');
+              setCcModule('');
+              setCcThreshold('');
+              setCcCode(CUSTOM_TEMPLATE);
+              setIsAddCheckOpen(false);
+            }}
+            className="bg-white rounded-2xl border border-slate-200 shadow-2xl w-full max-w-2xl overflow-hidden"
+          >
+            <div className="px-5 py-3.5 border-b border-slate-200 flex justify-between items-center">
+              <h3 className="font-bold text-sm text-slate-800">Новая проверка (Quality Gate)</h3>
+              <button type="button" onClick={() => setIsAddCheckOpen(false)} className="text-slate-400 hover:text-slate-700 cursor-pointer">
+                ✕
+              </button>
+            </div>
+            <div className="p-5 space-y-3">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <label className="text-xs font-semibold text-slate-600 sm:col-span-1">
+                  Название
+                  <input
+                    value={ccName}
+                    onChange={(e) => setCcName(e.target.value)}
+                    required
+                    className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-normal"
+                    placeholder="Approval Rate упал"
+                  />
+                </label>
+                <label className="text-xs font-semibold text-slate-600">
+                  Модуль
+                  <input
+                    value={ccModule}
+                    onChange={(e) => setCcModule(e.target.value)}
+                    list="cc-modules"
+                    className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-normal"
+                    placeholder="decisionResult › decision"
+                  />
+                  <datalist id="cc-modules">
+                    {moduleBlocks.map((b) => (
+                      <option key={b.name} value={b.name} />
+                    ))}
+                  </datalist>
+                </label>
+                <label className="text-xs font-semibold text-slate-600">
+                  Порог
+                  <input
+                    value={ccThreshold}
+                    onChange={(e) => setCcThreshold(e.target.value)}
+                    className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-normal"
+                    placeholder="5%"
+                  />
+                </label>
+              </div>
+              <div>
+                <div className="text-xs font-semibold text-slate-600 mb-1">Код проверки (Python)</div>
+                <div className="rounded-lg overflow-hidden border border-slate-700 text-xs">
+                  <CodeMirror value={ccCode} height="260px" theme="dark" extensions={[python()]} onChange={(v) => setCcCode(v)} />
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-500">Проверка сохранится в браузере. Запуск на бэкенде появится, когда у него будет эндпоинт для новых проверок.</p>
+            </div>
+            <div className="px-5 py-3 border-t border-slate-200 flex justify-end gap-2 bg-slate-50">
+              <button type="button" onClick={() => setIsAddCheckOpen(false)} className="px-4 py-1.5 text-xs text-slate-700 bg-white border border-slate-300 rounded-lg cursor-pointer">
+                Отмена
+              </button>
+              <button type="submit" className="px-4 py-1.5 text-xs font-semibold text-white bg-slate-900 hover:bg-blue-600 rounded-lg cursor-pointer">
                 Создать
               </button>
             </div>
