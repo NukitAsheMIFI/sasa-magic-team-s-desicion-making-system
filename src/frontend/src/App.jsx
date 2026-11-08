@@ -51,6 +51,12 @@ const getJson = async (path, signal) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const isEmpty = (v) => v === null || v === undefined || v === '';
 const normId = (x) => String(x ?? '').trim().replace(/^APP-/, '');
+// Метрика проверки: доля (0..1) показывается процентами, а большие значения (например, сумма лимитов) числом
+const fmtMetric = (x) => {
+  const n = Number(x);
+  if (x === null || x === undefined || !Number.isFinite(n)) return '—';
+  return Math.abs(n) > 1 ? n.toLocaleString('ru-RU', { maximumFractionDigits: 2 }) : `${(n * 100).toFixed(1)}%`;
+};
 const fmtPct = (x) => (Number.isFinite(Number(x)) && x !== null ? `${(Number(x) * 100).toFixed(1)}%` : '—');
 const escapeHtml = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -230,6 +236,35 @@ export default function App() {
   const aiReqRef = useRef(0);
   const [runTag, setRunTag] = useState('Сравнение MASTER vs BETA');
 
+  // Названия прогонов: берём из config бэкенда, а свои переименования храним в браузере
+  const [runNames, setRunNames] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem('spr_run_names_v1') || '{}');
+    } catch {
+      return {};
+    }
+  });
+  const [renamingRun, setRenamingRun] = useState(false);
+  const [renameValue, setRenameValue] = useState('');
+  const saveRunName = (id, name) => {
+    setRunNames((m) => {
+      const next = { ...m };
+      if (name.trim()) next[id] = name.trim();
+      else delete next[id];
+      try {
+        localStorage.setItem('spr_run_names_v1', JSON.stringify(next));
+      } catch {
+        /* localStorage недоступен */
+      }
+      return next;
+    });
+  };
+  const runNameOf = (r) => {
+    if (!r) return '';
+    const c = r.config ?? {};
+    return String(runNames[r.id] || c.runTag || c.run_tag || c.name || c.datasetName || r.name || r.run_tag || r.title || '').trim();
+  };
+
   // Свои входные данные: JSON до (MASTER) и после (BETA), загружаются на бэкенд перед запуском прогона
   const [dsName, setDsName] = useState('');
   const [beforeFiles, setBeforeFiles] = useState([]);
@@ -277,20 +312,37 @@ export default function App() {
   const [codeModal, setCodeModal] = useState({ isOpen: false, title: '', code: '' });
 
   // Пользовательские Quality Gates (бэкенд пока не умеет их сохранять и запускать, поэтому хранятся локально)
-  const CUSTOM_TEMPLATE = `# df: pandas DataFrame строк сравнения прогона (MASTER vs BETA).
-# Колонки: APP_ID, PREFIX, CLASS, SUFFIX, ARRAY_KEY, KEY, VALUE_BEFORE, VALUE_AFTER,
-#          ADJUSTED_BEFORE, ADJUSTED_AFTER, DIFF_FLAG
-# Функция run возвращает список срезов: label, argument, cnt, total (+ необязательно app_ids, metric, result).
-def run(df):
-    d = df[(df["PREFIX"] == "decisionResult") & (df["CLASS"] == "decision") & (df["KEY"] == "decision")]
-    lost = d[(d["VALUE_BEFORE"] == "APPROVE") & (d["VALUE_AFTER"] != "APPROVE")]
+  const CUSTOM_TEMPLATE = `# -*- coding: utf-8 -*-
+"""Шаблон проверки в формате репозитория (src/checks): run(mart, params) + CHECK."""
+
+DEFAULTS = {
+    "app_ids_limit": 20,   # максимум ID заявок в строке
+}
+
+def run(mart, params=None):
+    p = {**DEFAULTS, **(params or {})}
+    total = mart.total_apps()
+
+    # заявки, у которых было APPROVE, а стало что-то другое
+    lost = {
+        s["APP_ID"] for s in mart.segments()
+        if s.get("DECISION_BEFORE") == "APPROVE" and s.get("DECISION_AFTER") != "APPROVE"
+    }
     return [{
-        "label": "Потеряны одобрения",
-        "argument": "APPROVE -> не APPROVE",
-        "cnt": int(len(lost)),
-        "total": int(len(d)),
-        "app_ids": lost["APP_ID"].astype(str).tolist(),
+        "LABEL": CHECK["label"], "SOURCE": "AFTER", "ARGUMENT": "APPROVE -> не APPROVE",
+        "CNT": len(lost), "TOTAL": total,
+        "METRIC": round(len(lost) / total, 4) if total else 0.0,
+        "APP_IDS": sorted(lost)[:p["app_ids_limit"]],
+        "RESULT": "FAIL" if lost else "PASS", "CONFIDENCE": "HIGH",
     }]
+
+
+CHECK = {
+    "id": "my_check",
+    "label": "Моя проверка",
+    "params": DEFAULTS,
+    "entrypoint": run,
+}
 `;
   const [customChecks, setCustomChecks] = useState(() => {
     try {
@@ -487,6 +539,26 @@ def run(df):
     [fetchSteps]
   );
 
+  // Итоговые строки пользовательской проверки: результат из кода, а если его нет, то по порогу
+  const finalizeCustomRows = (list, c) => {
+    const thr = parseThreshold(c.threshold);
+    return list.map(normalizeCheck).map((r) => {
+      let result = r.RESULT === 'PASS' || r.RESULT === 'FAIL' ? r.RESULT : null;
+      const metric = r.METRIC !== null && r.METRIC !== undefined ? Number(r.METRIC) : r.TOTAL > 0 ? r.CNT / r.TOTAL : null;
+      if (!result) result = thr !== null && metric !== null ? (metric > thr ? 'FAIL' : 'PASS') : r.CNT > 0 ? 'FAIL' : 'PASS';
+      return { ...r, LABEL: r.LABEL === '—' ? c.name : r.LABEL, METRIC: metric, RESULT: result };
+    });
+  };
+
+  // Результаты проверки, уже сохранённые бэкендом для выбранного прогона (по названию), без повторов по ARGUMENT
+  const dbRowsFor = (c) => {
+    const byArg = new Map();
+    rawDbChecks
+      .filter((r) => (r.label ?? r.LABEL) === c.name)
+      .forEach((r) => byArg.set(String(r.argument ?? r.ARGUMENT ?? ''), r));
+    return finalizeCustomRows(Array.from(byArg.values()), c);
+  };
+
   // Запуск пользовательской проверки на бэкенде: POST /api/reports/{run_id}/checks/custom
   const runCustomCheck = async (c) => {
     if (!runId || apiStatus !== 'connected') return;
@@ -508,14 +580,18 @@ def run(df):
         throw new Error(`HTTP ${res.status}: ${String(detail).slice(-800)}`);
       }
       const data = await res.json();
-      const list = Array.isArray(data) ? data : data.results ?? data.checks ?? [];
-      const thr = parseThreshold(c.threshold);
-      const rows = list.map(normalizeCheck).map((r) => {
-        let result = r.RESULT === 'PASS' || r.RESULT === 'FAIL' ? r.RESULT : null;
-        const metric = r.METRIC !== null && r.METRIC !== undefined ? Number(r.METRIC) : r.TOTAL > 0 ? r.CNT / r.TOTAL : null;
-        if (!result) result = thr !== null && metric !== null ? (metric > thr ? 'FAIL' : 'PASS') : r.CNT > 0 ? 'FAIL' : 'PASS';
-        return { ...r, LABEL: r.LABEL === '—' ? c.name : r.LABEL, METRIC: metric, RESULT: result };
-      });
+      let list = Array.isArray(data) ? data : data.results ?? data.checks ?? null;
+      if (!list) {
+        // Бэкенд сохраняет строки в БД и отвечает только {status, message: "...сохранено строк: N"}:
+        // забираем свежие строки из /checks (последние N с названием этой проверки) и обновляем общую таблицу
+        const n = Number((String(data?.message ?? '').match(/(\d+)\D*$/) || [])[1]);
+        const all = await getJson(`/api/reports/${runId}/checks`);
+        const allList = Array.isArray(all) ? all : [];
+        setRawDbChecks(allList);
+        const mine = allList.filter((r) => (r.label ?? r.LABEL) === c.name);
+        list = Number.isFinite(n) && n > 0 ? mine.slice(-n) : mine;
+      }
+      const rows = finalizeCustomRows(list, c);
       setCustomRuns((m) => ({ ...m, [c.id]: { status: 'done', rows } }));
     } catch (e) {
       setCustomRuns((m) => ({ ...m, [c.id]: { status: 'error', error: e.message || String(e) } }));
@@ -534,7 +610,7 @@ def run(df):
     };
   }, [beforeFiles, afterFiles]);
 
-  // POST /api/datasets (multipart): dataset_name, before[], after[]  → {datasetName, sourceDir} или {config: {...}}
+  // POST /api/datasets/ (multipart): dataset_name, before[], after[]  → {datasetName, sourceDir} или {config: {...}}
   const uploadDataset = async () => {
     if (uploadBusy) return;
     setUploadError(null);
@@ -548,14 +624,14 @@ def run(df):
       fd.append('dataset_name', dsName.trim());
       beforeFiles.forEach((f) => fd.append('before', f, f.name));
       afterFiles.forEach((f) => fd.append('after', f, f.name));
-      const res = await fetch(api('/api/datasets'), { method: 'POST', body: fd });
+      const res = await fetch(api('/api/datasets/'), { method: 'POST', body: fd });
       if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
       const data = await res.json().catch(() => ({}));
-      const config = data.config ?? {
-        datasetName: data.datasetName ?? data.dataset_name ?? dsName.trim(),
-        ...(data.sourceDir ?? data.source_dir ? { sourceDir: data.sourceDir ?? data.source_dir } : {})
-      };
+      // Весь ответ (datasetName, sourceDir, before_dir, after_dir ...) уходит в config прогона, кроме текстового message
+      const { message: _msg, ...rest } = data && typeof data === 'object' ? data : {};
+      const config = data?.config ?? { datasetName: dsName.trim(), ...rest };
       setUploadedDataset({ config, pairs: pairInfo.paired });
+      setRunTag((t) => (t === 'Сравнение MASTER vs BETA' ? `${dsName.trim()} · ${new Date().toLocaleDateString('ru-RU')}` : t));
     } catch (e) {
       setUploadError(`Не удалось загрузить данные: ${e.message}`);
     } finally {
@@ -1053,7 +1129,7 @@ def run(df):
           <tr>
             <td><b>${escapeHtml(c.LABEL)}</b>${c.ESTIMATE ? ' <i>(оценка по витрине)</i>' : ''}</td>
             <td><code>${escapeHtml(c.ARGUMENT)}</code></td>
-            <td>${escapeHtml(c.METRIC === null ? '—' : fmtPct(c.METRIC))}</td>
+            <td>${escapeHtml(c.METRIC === null ? '—' : fmtMetric(c.METRIC))}</td>
             <td>${escapeHtml(c.CNT)} из ${escapeHtml(c.TOTAL || '—')}</td>
             <td><span class="${c.RESULT === 'PASS' ? 'badge-pass' : 'badge-fail'}">${escapeHtml(c.RESULT)}</span></td>
           </tr>`
@@ -1081,8 +1157,8 @@ def run(df):
   </style>
 </head>
 <body>
-  <h2>Отчёт аудита кредитных стратегий СПР (Прогон #${escapeHtml(runId)})</h2>
-  <p style="color:#64748b;font-size:12px;">${escapeHtml(runInfo?.config?.runTag || '')} · Сформировано: ${escapeHtml(reportDate)} · Аналитик: ${escapeHtml(currentUser.name)} (${escapeHtml(currentUser.role)})</p>
+  <h2>Отчёт аудита кредитных стратегий СПР (Прогон #${escapeHtml(runId)}${currentRunName ? ' · ' + escapeHtml(currentRunName) : ''})</h2>
+  <p style="color:#64748b;font-size:12px;">${escapeHtml(currentRunName)} · Сформировано: ${escapeHtml(reportDate)} · Аналитик: ${escapeHtml(currentUser.name)} (${escapeHtml(currentUser.role)})</p>
   <div class="card">
     <h3>Macro Impact</h3>
     <p>Анкет в выборке: <b>${summaryMetrics.totalPortfolio}</b></p>
@@ -1162,7 +1238,7 @@ def run(df):
   // Одна строка таблицы проверок (обычная или вложенный срез внутри группы)
   const renderCheckRow = (c, key, nested) => {
     const hasAppIds = c.APP_IDS.length > 0 || (hasDecisions && flipsCovered && c.RESULT === 'FAIL' && (c.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(c.LABEL || '')));
-    const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID];
+    const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID] || customChecks.find((x) => x.name === c.LABEL)?.code;
     return (
       <tr key={key} className={nested ? 'bg-slate-50/70' : 'hover:bg-slate-50 transition'}>
         <td className="py-2.5 px-4 font-semibold text-slate-800">
@@ -1196,7 +1272,7 @@ def run(df):
             <span className="text-slate-800">{c.CNT}</span>
           )}
         </td>
-        <td className="py-2.5 px-4 text-center font-mono text-slate-700">{c.METRIC === null ? '—' : fmtPct(c.METRIC)}</td>
+        <td className="py-2.5 px-4 text-center font-mono text-slate-700">{c.METRIC === null ? '—' : fmtMetric(c.METRIC)}</td>
         <td className="py-2.5 px-4 text-center">
           <span
             className={`px-2 py-0.5 rounded text-[10px] font-bold ${
@@ -1223,6 +1299,7 @@ def run(df):
     );
   };
 
+  const currentRunName = runNameOf(availableRuns.find((r) => String(r.id) === String(runId)));
   const runOptions = availableRuns.length > 0 ? availableRuns : [{ id: 'demo', status: 'demo', config: { runTag: 'демо-данные' } }];
   const isFallback = apiStatus === 'fallback';
 
@@ -1297,10 +1374,45 @@ def run(df):
             >
               {runOptions.map((r) => (
                 <option key={r.id} value={r.id}>
-                  #{r.id} · {r.config?.runTag || r.status || 'done'}
+                  #{r.id} · {runNameOf(r) ? `${runNameOf(r)} · ` : ''}{r.status || 'done'}
                 </option>
               ))}
             </select>
+            {runId && runId !== 'demo' && !renamingRun && (
+              <button
+                onClick={() => {
+                  setRenameValue(currentRunName);
+                  setRenamingRun(true);
+                }}
+                className="text-slate-400 hover:text-slate-800 cursor-pointer font-sans"
+                title="Переименовать прогон (сохраняется в браузере)"
+              >
+                ✎
+              </button>
+            )}
+            {renamingRun && (
+              <input
+                autoFocus
+                value={renameValue}
+                onChange={(e) => setRenameValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    saveRunName(runId, renameValue);
+                    setRenamingRun(false);
+                  }
+                  if (e.key === 'Escape') {
+                    e.stopPropagation();
+                    setRenamingRun(false);
+                  }
+                }}
+                onBlur={() => {
+                  saveRunName(runId, renameValue);
+                  setRenamingRun(false);
+                }}
+                placeholder="Название прогона"
+                className="w-44 border border-slate-300 rounded px-1.5 py-0.5 font-sans text-xs bg-white"
+              />
+            )}
           </div>
           {isLoadingApi && <span className="text-xs text-blue-600 animate-pulse font-semibold">Загрузка…</span>}
         </div>
@@ -1479,7 +1591,7 @@ def run(df):
                     {checkGroups.map((g) => {
                       if (g.items.length === 1) return renderCheckRow(g.items[0], g.label, false);
                       const open = !!expandedChecks[g.label];
-                      const code = REPO_PYTHON_SCRIPTS[g.checkId];
+                      const code = REPO_PYTHON_SCRIPTS[g.checkId] || customChecks.find((x) => x.name === g.label)?.code;
                       return (
                         <React.Fragment key={g.label}>
                           <tr
@@ -1496,7 +1608,7 @@ def run(df):
                             </td>
                             <td className="py-2.5 px-4 text-slate-400">{open ? 'свернуть' : 'развернуть'}</td>
                             <td className="py-2.5 px-4 text-center font-mono text-slate-700">до {g.maxCnt}</td>
-                            <td className="py-2.5 px-4 text-center font-mono text-slate-700">{g.maxMetric === null ? '—' : `до ${fmtPct(g.maxMetric)}`}</td>
+                            <td className="py-2.5 px-4 text-center font-mono text-slate-700">{g.maxMetric === null ? '—' : `до ${fmtMetric(g.maxMetric)}`}</td>
                             <td className="py-2.5 px-4 text-center">
                               <span
                                 className={`px-2 py-0.5 rounded text-[10px] font-bold ${
@@ -1554,8 +1666,8 @@ def run(df):
                 <tbody className="divide-y divide-slate-100">
                   {customChecks.map((c) => {
                     const run = customRuns[c.id];
-                    const rows = run?.status === 'done' ? run.rows : [];
-                    const overall = run?.status === 'done' ? (rows.length === 0 ? 'EMPTY' : rows.some((r) => r.RESULT === 'FAIL') ? 'FAIL' : 'PASS') : run?.status === 'error' ? 'ERROR' : run?.status === 'running' ? 'RUNNING' : 'NONE';
+                    const rows = run?.status === 'done' ? run.rows : !run ? dbRowsFor(c) : [];
+                    const overall = run?.status === 'done' || (!run && rows.length > 0) ? (rows.length === 0 ? 'EMPTY' : rows.some((r) => r.RESULT === 'FAIL') ? 'FAIL' : 'PASS') : run?.status === 'error' ? 'ERROR' : run?.status === 'running' ? 'RUNNING' : 'NONE';
                     const maxCnt = rows.reduce((m, r) => Math.max(m, r.CNT), 0);
                     const maxMetric = rows.reduce((m, r) => (r.METRIC !== null && r.METRIC > m ? r.METRIC : m), 0);
                     const badge = {
@@ -1582,7 +1694,7 @@ def run(df):
                           <td className="py-2.5 px-4 font-mono text-slate-600">{c.module || '—'}</td>
                           <td className="py-2.5 px-4 text-center font-mono">{c.threshold || '—'}</td>
                           <td className="py-2.5 px-4 text-center font-mono font-bold">{rows.length ? (rows.length > 1 ? `до ${maxCnt}` : maxCnt) : '—'}</td>
-                          <td className="py-2.5 px-4 text-center font-mono">{rows.length ? fmtPct(maxMetric) : '—'}</td>
+                          <td className="py-2.5 px-4 text-center font-mono">{rows.length ? fmtMetric(maxMetric) : '—'}</td>
                           <td className="py-2.5 px-4 text-center">
                             <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${badge}`}>{label}</span>
                           </td>
@@ -1635,7 +1747,7 @@ def run(df):
                                   r.CNT
                                 )}
                               </td>
-                              <td className="py-2 px-4 text-center font-mono">{r.METRIC === null ? '—' : fmtPct(r.METRIC)}</td>
+                              <td className="py-2 px-4 text-center font-mono">{r.METRIC === null ? '—' : fmtMetric(r.METRIC)}</td>
                               <td className="py-2 px-4 text-center">
                                 <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${r.RESULT === 'FAIL' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{r.RESULT}</span>
                               </td>
@@ -1987,7 +2099,7 @@ def run(df):
 
             <div className="flex flex-wrap justify-between items-center gap-3 border-b border-slate-100 pb-3">
               <div>
-                <h3 className="text-base font-bold text-slate-800">Реестр кредитных заявок (Прогон #{runId})</h3>
+                <h3 className="text-base font-bold text-slate-800">Реестр кредитных заявок (Прогон #{runId}{currentRunName ? ` · ${currentRunName}` : ''})</h3>
                 <p className="text-xs text-slate-500">
                   Подходит: <b>{filteredApps.length}</b> из {applications.length} анкет · сверху заявки с наибольшим риском и числом расхождений{applications.length < portfolioSize && ` · в реестре только заявки с расхождениями (всего в выборке ${portfolioSize.toLocaleString('ru-RU')})`}
                 </p>
@@ -2195,6 +2307,13 @@ def run(df):
               >
                 {uploadBusy ? 'Загружаем…' : '⬆ Загрузить данные'}
               </button>
+              {!uploadBusy && !isFallback && (beforeFiles.length === 0 || afterFiles.length === 0) && (
+                <p className="text-[11px] text-slate-500">
+                  Кнопка включится, когда выбраны файлы{beforeFiles.length === 0 ? ' BEFORE' : ''}
+                  {beforeFiles.length === 0 && afterFiles.length === 0 ? ' и' : ''}
+                  {afterFiles.length === 0 ? ' AFTER' : ''}.
+                </p>
+              )}
             </div>
 
             <label className="block text-xs text-slate-600">
@@ -2228,7 +2347,7 @@ def run(df):
           </div>
 
           <div className="bg-white p-6 rounded-xl border border-slate-200 shadow-sm space-y-3">
-            <h3 className="text-sm font-bold text-slate-800">Журнал этапов пайплайна (прогон #{runId})</h3>
+            <h3 className="text-sm font-bold text-slate-800">Журнал этапов пайплайна (прогон #{runId}{currentRunName ? ` · ${currentRunName}` : ''})</h3>
             {isFallback ? (
               <p className="text-xs text-slate-500">В демо-режиме данные об этапах недоступны.</p>
             ) : pipelineSteps.length === 0 ? (
@@ -2431,7 +2550,55 @@ def run(df):
                 </label>
               </div>
               <div>
-                <div className="text-xs font-semibold text-slate-600 mb-1">Код проверки (Python)</div>
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
+                  <div className="text-xs font-semibold text-slate-600">Код проверки (Python)</div>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                    <select
+                      value=""
+                      onChange={(e) => {
+                        const id = e.target.value;
+                        if (!id) return;
+                        const code = id === '__blank' ? CUSTOM_TEMPLATE : REPO_PYTHON_SCRIPTS[id];
+                        if (!code) return;
+                        setCcCode(code);
+                        const lbl = (code.match(/"label":\s*"([^"]+)"/) || [])[1];
+                        if (lbl && !ccName.trim()) setCcName(lbl);
+                        setCcError(null);
+                      }}
+                      className="border border-slate-300 rounded-lg px-2 py-1 bg-white text-slate-700 cursor-pointer"
+                    >
+                      <option value="">Взять за основу…</option>
+                      <option value="__blank">Пустой шаблон</option>
+                      {Object.entries(REPO_PYTHON_SCRIPTS).map(([id, code]) => (
+                        <option key={id} value={id}>
+                          {(code.match(/"label":\s*"([^"]+)"/) || [])[1] || id}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="border border-slate-300 rounded-lg px-2 py-1 bg-white text-slate-700 cursor-pointer hover:bg-slate-50">
+                      Загрузить .py
+                      <input
+                        type="file"
+                        accept=".py,text/x-python,text/plain"
+                        className="hidden"
+                        onChange={async (e) => {
+                          const f = e.target.files?.[0];
+                          e.target.value = '';
+                          if (!f) return;
+                          try {
+                            const text = await f.text();
+                            setCcCode(text);
+                            const lbl = (text.match(/"label":\s*"([^"]+)"/) || [])[1];
+                            if (lbl && !ccName.trim()) setCcName(lbl);
+                            setCcError(null);
+                          } catch {
+                            setCcError('Не удалось прочитать файл.');
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+                </div>
                 <div className="rounded-lg overflow-hidden border border-slate-700 text-xs">
                   <CodeMirror value={ccCode} height="260px" theme="dark" extensions={[python()]} onChange={(v) => setCcCode(v)} />
                 </div>
@@ -2478,3 +2645,4 @@ def run(df):
     </div>
   );
 }
+  
