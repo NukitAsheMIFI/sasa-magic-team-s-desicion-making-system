@@ -98,3 +98,15 @@ class Segment(Base):
     pd_model_after = Column(String, nullable=True)
     cutoff_before = Column(String, nullable=True)
     cutoff_after = Column(String, nullable=True)
+
+class Verdict(Base):
+    __tablename__ = "verdicts"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("runs.id"), index=True)
+    total_apps = Column(Integer)
+    ar_before = Column(Float)
+    ar_after = Column(Float)
+    new_approved = Column(Integer)
+    lost_approved = Column(Integer)
+    net_impact = Column(Integer)
+    summary = Column(String)
