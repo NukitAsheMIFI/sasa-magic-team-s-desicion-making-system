@@ -12,7 +12,9 @@ import sqlite3
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "hackathon.db")
+# Ищем базу данных в папке backend (поднимаемся на уровень выше из analytics)
+DB_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "backend", "hackathon.db"))
+# Ищем проверки в папке src/checks
 CHECKS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "checks"))
 
 

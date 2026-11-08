@@ -5,7 +5,7 @@ from datetime import datetime
 
 class RunCreate(BaseModel):
     user_id: int
-    config: Dict[str, Any] 
+    config: Dict[str, Any] = {}
 
 
 class RunResponse(BaseModel):
@@ -26,5 +26,14 @@ class StepResponse(BaseModel):
     finished_at: Optional[str] = None
     code_ref: Optional[str] = None # ссылка на скрипт
     
+    class Config:
+        from_attributes = True
+class UserLogin(BaseModel):
+    username: str
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+
     class Config:
         from_attributes = True

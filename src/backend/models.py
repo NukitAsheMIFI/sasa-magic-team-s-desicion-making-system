@@ -67,4 +67,34 @@ class PivotFact(Base):
     diff_flag = Column(Integer)
     source = Column(String) # BEFORE (MASTER) / AFTER (BETA)
     cnt = Column(Integer)
+
+class CheckResult(Base):
+    __tablename__ = "check_results"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("runs.id"), index=True)
     
+    label = Column(String)       # Название проверки (LABEL)
+    source = Column(String)      # BEFORE / AFTER
+    argument = Column(String)    # Предмет проверки (ARGUMENT)
+    cnt = Column(Integer)        # Сколько заявок (CNT)
+    total = Column(Integer)      # База (TOTAL)
+    metric = Column(Float)       # Метрика (METRIC)
+    result = Column(String)      # PASS / FAIL
+    confidence = Column(String)  # HIGH / LOW
+    app_ids = Column(JSON)       # Список ID заявок (сохраняем как JSON)
+
+class Segment(Base):
+    __tablename__ = "segments"
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("runs.id"), index=True)
+    app_id = Column(String, index=True)
+    
+    decision_before = Column(String, nullable=True)
+    decision_after = Column(String, nullable=True)
+    decision_changed = Column(Integer, default=0)
+    
+    products = Column(String, nullable=True)
+    pd_model_before = Column(String, nullable=True)
+    pd_model_after = Column(String, nullable=True)
+    cutoff_before = Column(String, nullable=True)
+    cutoff_after = Column(String, nullable=True)

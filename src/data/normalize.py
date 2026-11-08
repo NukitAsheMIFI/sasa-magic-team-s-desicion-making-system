@@ -102,8 +102,10 @@ def flatten_json_recursive(node, path_segments, array_keys, rows, app_id, source
     else:
         _emit_row(rows, app_id, source, path_segments, array_keys, node)
 
-def normalize_file(file_path, source="BEFORE"):
-    app_id = os.path.splitext(os.path.basename(file_path))[0]
+def normalize_file(file_path, source="BEFORE", app_id=None):
+    # Если app_id не передали (как в старой версии), берем его из имени файла
+    if app_id is None:
+        app_id = os.path.splitext(os.path.basename(file_path))[0]
     with open(file_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
