@@ -48,54 +48,33 @@ def _e(v) -> str:
     """HTML-escape + None → пустая строка."""
     return "" if v is None else escape(str(v))
 
-
-def _load_verdict(run_row, run_id: int):
-    """Ищем verdict.json: сначала в config запуска, потом в типовых местах."""
-    # 1) Из config
-    raw_cfg = run_row["config"] if run_row else None
-    if raw_cfg:
-        try:
-            cfg = json.loads(raw_cfg) if isinstance(raw_cfg, str) else raw_cfg
-            if isinstance(cfg, dict):
-                for key in ("verdict_path", "verdict_file", "results_dir",
-                            "out_dir", "data_dir", "run_dir"):
-                    val = cfg.get(key)
-                    if not val:
-                        continue
-                    if os.path.isfile(val):
-                        with open(val, "r", encoding="utf-8") as f:
-                            return json.load(f), val
-                    vfile = os.path.join(val, "verdict.json")
-                    if os.path.isfile(vfile):
-                        with open(vfile, "r", encoding="utf-8") as f:
-                            return json.load(f), vfile
-        except Exception:
-            pass
-
-    # 2) Типовые места + рекурсивный поиск, берём самый свежий
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, "..", "data", "RUN-20260827-0001", "RESULTS", "verdict.json"),
-        os.path.join(here, "..", "..", "data", "RUN-20260827-0001", "RESULTS", "verdict.json"),
-    ]
-    globs = glob.glob(os.path.join(here, "..", "**", "verdict.json"), recursive=True)
-    all_paths = [os.path.abspath(p) for p in candidates + globs if os.path.isfile(p)]
-    if not all_paths:
-        return None, None
-
-    newest = max(all_paths, key=os.path.getmtime)
+def _load_verdict(cur, run_id: int):
+    """Читаем вердикт напрямую из БД (таблица verdicts)"""
     try:
-        with open(newest, "r", encoding="utf-8") as f:
-            return json.load(f), newest
-    except Exception:
-        return None, None
+        cur.execute("SELECT * FROM verdicts WHERE run_id = ?", (run_id,))
+        row = cur.fetchone()
+        if row:
+            return dict(row), "База данных (таблица verdicts)"
+    except Exception as e:
+        print(f"Ошибка чтения вердикта из БД: {e}")
+    
+    return None, None
 
-
-def generate_html_report(run_id: int) -> str:
-    db_path = _get_db_path()
+def generate_html_report(run_id: int, db_path: str = None) -> str:
+    # Если путь к БД передан из FastAPI, используем его. Иначе ищем сами.
+    if not db_path:
+        db_path = _get_db_path()
+        
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
+    
+    # ... (остальной код получения run, steps, apps, facts и checks остается без изменений) ...
+    
+    # А вот строчку с вердиктом меняем:
+    # БЫЛО: verdict, verdict_src = _load_verdict(run, run_id)
+    # СТАЛО:
+    verdict, verdict_src = _load_verdict(cur, run_id)
 
     # ---- Запуск + пользователь ----
     cur.execute("""
