@@ -36,11 +36,6 @@ const LABEL_TO_CHECK_ID = Object.fromEntries(
   Object.entries(REPO_PYTHON_SCRIPTS).map(([id, code]) => [(code.match(/"label":\s*"([^"]+)"/) || [])[1], id])
 );
 
-const INITIAL_ANALYSTS = [
-  { id: '1', name: 'Аналитик 1 (Иван Семенов)', username: 'ivan', role: 'Lead Risk Modeler' },
-  { id: '2', name: 'Аналитик 2 (Мария Васильева)', username: 'maria', role: 'Senior Strategy Validator' }
-];
-
 // ----------------------------------------------------
 // Утилиты
 // ----------------------------------------------------
@@ -144,6 +139,14 @@ const normalizeCheck = (c) => {
   };
 };
 
+// Порог пользовательской проверки: "5%", "0.05", "5" (число больше 1 считается процентами)
+const parseThreshold = (t) => {
+  const m = String(t ?? '').trim().replace(',', '.').match(/^(\d+(?:\.\d+)?)\s*(%?)$/);
+  if (!m) return null;
+  const v = parseFloat(m[1]);
+  return m[2] ? v / 100 : v > 1 ? v / 100 : v;
+};
+
 // Значение ячейки: пустое показываем как «нет» (атрибут отсутствовал до/после)
 const Cell = ({ v }) =>
   isEmpty(v) ? <span className="text-slate-300 italic font-sans">нет</span> : <span>{String(v)}</span>;
@@ -156,28 +159,60 @@ export default function App() {
   const [isLoadingApi, setIsLoadingApi] = useState(false);
   const [loadError, setLoadError] = useState(null);
 
-  // Аналитики
-  const [analysts, setAnalysts] = useState(() => {
+  // Вход по логину (без пароля): POST /api/auth/login → {id, username}. Сессия хранится в localStorage.
+  const [session, setSession] = useState(() => {
     try {
-      const saved = localStorage.getItem('spr_analysts_list_v7');
-      return saved ? JSON.parse(saved) : INITIAL_ANALYSTS;
+      const saved = JSON.parse(localStorage.getItem('spr_session_v1') || 'null');
+      return saved && (saved.demo || saved.id != null) ? saved : null;
     } catch {
-      return INITIAL_ANALYSTS;
+      return null;
     }
   });
-  const [currentUser, setCurrentUser] = useState(() => analysts[0] || INITIAL_ANALYSTS[0]);
-  const [isAddUserModalOpen, setIsAddUserModalOpen] = useState(false);
-  const [newUserName, setNewUserName] = useState('');
-  const [newUserRole, setNewUserRole] = useState('Риск-аналитик');
-  const [newUserUsername, setNewUserUsername] = useState('');
+  const [loginName, setLoginName] = useState('');
+  const [loginError, setLoginError] = useState(null);
+  const [loginBusy, setLoginBusy] = useState(false);
+  const currentUser = useMemo(
+    () => ({
+      id: session?.id ?? 'demo',
+      name: session?.username ?? 'demo',
+      username: session?.username ?? 'demo',
+      backendId: session?.demo ? null : session?.id ?? null
+    }),
+    [session]
+  );
 
-  useEffect(() => {
+  const saveSession = (sess) => {
+    setSession(sess);
     try {
-      localStorage.setItem('spr_analysts_list_v7', JSON.stringify(analysts));
+      if (sess) localStorage.setItem('spr_session_v1', JSON.stringify(sess));
+      else localStorage.removeItem('spr_session_v1');
     } catch {
       /* localStorage недоступен */
     }
-  }, [analysts]);
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    const username = loginName.trim();
+    if (!username || loginBusy) return;
+    setLoginBusy(true);
+    setLoginError(null);
+    try {
+      const res = await fetch(api('/api/auth/login'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username })
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.id == null) throw new Error('в ответе нет id пользователя');
+      saveSession({ id: data.id, username: data.username ?? username });
+    } catch (err) {
+      setLoginError(`Не удалось войти: ${err.message}`);
+    } finally {
+      setLoginBusy(false);
+    }
+  };
 
   // Данные прогона
   const [pivotFacts, setPivotFacts] = useState([]);
@@ -194,6 +229,14 @@ export default function App() {
   const [aiError, setAiError] = useState(null);
   const aiReqRef = useRef(0);
   const [runTag, setRunTag] = useState('Сравнение MASTER vs BETA');
+
+  // Свои входные данные: JSON до (MASTER) и после (BETA), загружаются на бэкенд перед запуском прогона
+  const [dsName, setDsName] = useState('');
+  const [beforeFiles, setBeforeFiles] = useState([]);
+  const [afterFiles, setAfterFiles] = useState([]);
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
+  const [uploadedDataset, setUploadedDataset] = useState(null); // конфиг, который вернул бэкенд
   const timerRef = useRef(null);
   const aliveRef = useRef(true);
 
@@ -234,12 +277,20 @@ export default function App() {
   const [codeModal, setCodeModal] = useState({ isOpen: false, title: '', code: '' });
 
   // Пользовательские Quality Gates (бэкенд пока не умеет их сохранять и запускать, поэтому хранятся локально)
-  const CUSTOM_TEMPLATE = `# Проверка получает pandas DataFrame витрины фактов (pivot facts)
-# и должна вернуть список срезов: label, argument, cnt, total, result
+  const CUSTOM_TEMPLATE = `# df: pandas DataFrame строк сравнения прогона (MASTER vs BETA).
+# Колонки: APP_ID, PREFIX, CLASS, SUFFIX, ARRAY_KEY, KEY, VALUE_BEFORE, VALUE_AFTER,
+#          ADJUSTED_BEFORE, ADJUSTED_AFTER, DIFF_FLAG
+# Функция run возвращает список срезов: label, argument, cnt, total (+ необязательно app_ids, metric, result).
 def run(df):
-    left = df[(df["DIFF_FLAG"] == "1") & (df["SOURCE"].str.startswith("BEFORE"))]
-    cnt = len(left)
-    return [{"label": "Моя проверка", "argument": "", "cnt": cnt, "total": len(df), "result": "FAIL" if cnt else "PASS"}]
+    d = df[(df["PREFIX"] == "decisionResult") & (df["CLASS"] == "decision") & (df["KEY"] == "decision")]
+    lost = d[(d["VALUE_BEFORE"] == "APPROVE") & (d["VALUE_AFTER"] != "APPROVE")]
+    return [{
+        "label": "Потеряны одобрения",
+        "argument": "APPROVE -> не APPROVE",
+        "cnt": int(len(lost)),
+        "total": int(len(d)),
+        "app_ids": lost["APP_ID"].astype(str).tolist(),
+    }]
 `;
   const [customChecks, setCustomChecks] = useState(() => {
     try {
@@ -249,6 +300,8 @@ def run(df):
     }
   });
   const [isAddCheckOpen, setIsAddCheckOpen] = useState(false);
+  const [ccError, setCcError] = useState(null);
+  const [customRuns, setCustomRuns] = useState({}); // id → {status: running|done|error, rows, error}
   const [ccName, setCcName] = useState('');
   const [ccModule, setCcModule] = useState('');
   const [ccThreshold, setCcThreshold] = useState('');
@@ -266,7 +319,6 @@ def run(df):
     const onKey = (e) => {
       if (e.key !== 'Escape') return;
       setCodeModal((m) => (m.isOpen ? { isOpen: false, title: '', code: '' } : m));
-      setIsAddUserModalOpen(false);
       setIsAddCheckOpen(false);
       setActiveDossierAppId(null);
     };
@@ -319,6 +371,31 @@ def run(df):
     setRawApplications(buildAppsFromCsv(fallbackComparisonCsv));
   }, [resetRunState]);
 
+  // Заявки: пробуем limit/offset, чтобы обойти лимит бэкенда. Если параметры не поддерживаются,
+  // повторные страницы не дадут новых app_id и цикл остановится на первой странице.
+  const fetchAllApplications = async (id, signal) => {
+    const SIZE = 5000;
+    const seen = new Set();
+    const all = [];
+    let offset = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const page = await getJson(`/api/reports/${id}/applications?limit=${SIZE}&offset=${offset}`, signal);
+      if (!Array.isArray(page) || page.length === 0) break;
+      let added = 0;
+      for (const a of page) {
+        const key = String(a.app_id ?? a.id);
+        if (!seen.has(key)) {
+          seen.add(key);
+          all.push(a);
+          added += 1;
+        }
+      }
+      if (added === 0 || page.length < 100 || page.length % 100 !== 0) break; // новых нет или явно последняя страница
+      offset += page.length;
+    }
+    return all;
+  };
+
   const loadReport = useCallback(
     async (id, signal) => {
       resetRunState();
@@ -332,7 +409,7 @@ def run(df):
         const [facts, checks, apps, steps] = await Promise.all([
           getJson(`/api/reports/${id}/pivot-facts`, signal),
           optional(getJson(`/api/reports/${id}/checks`, signal)),
-          optional(getJson(`/api/reports/${id}/applications`, signal)),
+          optional(fetchAllApplications(id, signal)),
           optional(getJson(`/api/runs/${id}/steps`, signal))
         ]);
         if (signal.aborted) return;
@@ -386,21 +463,6 @@ def run(df):
   // ----------------------------------------------------
   // Аналитики и запуск прогона
   // ----------------------------------------------------
-  const loginAnalyst = useCallback(async (user) => {
-    if (user.backendId) return user;
-    const res = await fetch(api('/api/auth/login'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: user.username })
-    });
-    if (!res.ok) throw new Error(`Вход аналитика «${user.username}»: HTTP ${res.status}`);
-    const data = await res.json();
-    const updated = { ...user, backendId: data.id };
-    setAnalysts((list) => list.map((a) => (a.id === user.id ? updated : a)));
-    setCurrentUser(updated);
-    return updated;
-  }, []);
-
   const pollRun = useCallback(
     async (id, initialStatus) => {
       let status = String(initialStatus || '').toLowerCase();
@@ -425,6 +487,82 @@ def run(df):
     [fetchSteps]
   );
 
+  // Запуск пользовательской проверки на бэкенде: POST /api/reports/{run_id}/checks/custom
+  const runCustomCheck = async (c) => {
+    if (!runId || apiStatus !== 'connected') return;
+    setCustomRuns((m) => ({ ...m, [c.id]: { status: 'running' } }));
+    try {
+      const res = await fetch(api(`/api/reports/${runId}/checks/custom`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: c.name, module: c.module, threshold: c.threshold, code: c.code })
+      });
+      if (!res.ok) {
+        let detail = '';
+        try {
+          const j = await res.json();
+          detail = typeof j.detail === 'string' ? j.detail : JSON.stringify(j);
+        } catch {
+          detail = await res.text().catch(() => '');
+        }
+        throw new Error(`HTTP ${res.status}: ${String(detail).slice(-800)}`);
+      }
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : data.results ?? data.checks ?? [];
+      const thr = parseThreshold(c.threshold);
+      const rows = list.map(normalizeCheck).map((r) => {
+        let result = r.RESULT === 'PASS' || r.RESULT === 'FAIL' ? r.RESULT : null;
+        const metric = r.METRIC !== null && r.METRIC !== undefined ? Number(r.METRIC) : r.TOTAL > 0 ? r.CNT / r.TOTAL : null;
+        if (!result) result = thr !== null && metric !== null ? (metric > thr ? 'FAIL' : 'PASS') : r.CNT > 0 ? 'FAIL' : 'PASS';
+        return { ...r, LABEL: r.LABEL === '—' ? c.name : r.LABEL, METRIC: metric, RESULT: result };
+      });
+      setCustomRuns((m) => ({ ...m, [c.id]: { status: 'done', rows } }));
+    } catch (e) {
+      setCustomRuns((m) => ({ ...m, [c.id]: { status: 'error', error: e.message || String(e) } }));
+    }
+  };
+
+  const jsonOnly = (list) => Array.from(list || []).filter((f) => f.name.toLowerCase().endsWith('.json'));
+  const baseName = (f) => f.name.replace(/\.json$/i, '');
+  const pairInfo = useMemo(() => {
+    const a = new Set(afterFiles.map(baseName));
+    const b = new Set(beforeFiles.map(baseName));
+    return {
+      paired: beforeFiles.filter((f) => a.has(baseName(f))).length,
+      onlyBefore: beforeFiles.filter((f) => !a.has(baseName(f))).length,
+      onlyAfter: afterFiles.filter((f) => !b.has(baseName(f))).length
+    };
+  }, [beforeFiles, afterFiles]);
+
+  // POST /api/datasets (multipart): dataset_name, before[], after[]  → {datasetName, sourceDir} или {config: {...}}
+  const uploadDataset = async () => {
+    if (uploadBusy) return;
+    setUploadError(null);
+    setUploadedDataset(null);
+    if (apiStatus !== 'connected') return setUploadError('Бэкенд недоступен: загрузка возможна только в режиме ONLINE.');
+    if (!dsName.trim()) return setUploadError('Укажите название набора данных.');
+    if (pairInfo.paired === 0) return setUploadError('Нет пар файлов: у BEFORE и AFTER должны совпадать имена (например I32554354.json).');
+    setUploadBusy(true);
+    try {
+      const fd = new FormData();
+      fd.append('dataset_name', dsName.trim());
+      beforeFiles.forEach((f) => fd.append('before', f, f.name));
+      afterFiles.forEach((f) => fd.append('after', f, f.name));
+      const res = await fetch(api('/api/datasets'), { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
+      const data = await res.json().catch(() => ({}));
+      const config = data.config ?? {
+        datasetName: data.datasetName ?? data.dataset_name ?? dsName.trim(),
+        ...(data.sourceDir ?? data.source_dir ? { sourceDir: data.sourceDir ?? data.source_dir } : {})
+      };
+      setUploadedDataset({ config, pairs: pairInfo.paired });
+    } catch (e) {
+      setUploadError(`Не удалось загрузить данные: ${e.message}`);
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
   const startRun = async () => {
     if (isPipelineRunning) return;
     setIsPipelineRunning(true);
@@ -435,14 +573,15 @@ def run(df):
 
     try {
       if (apiStatus !== 'connected') throw new Error('Бэкенд недоступен: запуск возможен только в режиме ONLINE.');
-      const user = await loginAnalyst(currentUser);
+      const user = currentUser;
+      if (user.backendId == null) throw new Error('Нужен вход под логином при подключённом бэкенде. Нажмите «Выйти» и войдите заново.');
       const baseConfig = availableRuns[0]?.config ?? {};
       const res = await fetch(api('/api/runs/'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           user_id: user.backendId,
-          config: { ...baseConfig, runTag: runTag.trim() || baseConfig.runTag || 'run' }
+          config: { ...baseConfig, ...(uploadedDataset?.config ?? {}), runTag: runTag.trim() || baseConfig.runTag || 'run' }
         })
       });
       if (!res.ok) throw new Error(`POST /api/runs/ → HTTP ${res.status}: ${(await res.text()).slice(0, 300)}`);
@@ -575,6 +714,14 @@ def run(df):
       }
     };
   }, [pivotFacts]);
+
+  // Список заявок покрывает все смены решения: бэкенд может отдавать не весь портфель, а только заявки с расхождениями
+  const flipsCovered = useMemo(() => {
+    if (!hasDecisions) return false;
+    const changed = applications.filter((a) => a.beforeDecision !== '—' && a.afterDecision !== '—' && a.beforeDecision !== a.afterDecision).length;
+    return changed >= summaryMetrics.totalFlips && summaryMetrics.totalFlips > 0;
+  }, [applications, hasDecisions, summaryMetrics.totalFlips]);
+
 
   const portfolioSize = summaryMetrics.totalPortfolio || applications.length;
 
@@ -793,6 +940,7 @@ def run(df):
   // Сброс резюме при смене прогона
   useEffect(() => {
     aiReqRef.current += 1;
+    setCustomRuns({});
     setAiSummary(null);
     setAiError(null);
     setAiLoading(false);
@@ -807,6 +955,9 @@ def run(df):
       // минимум 1 секунда индикатора, чтобы анимация не мигала
       const [data] = await Promise.all([getJson(`/api/reports/${runId}/ai-summary`), sleep(1000)]);
       if (req !== aiReqRef.current) return;
+      if (data && typeof data === 'object' && String(data.status || '').toLowerCase() === 'error') {
+        throw new Error(data.summary ?? data.message ?? 'бэкенд вернул status=error');
+      }
       let text = data;
       if (data && typeof data === 'object') {
         text = data.summary ?? data.text ?? data.content ?? data.message ?? data.result ?? data.ai_summary ?? JSON.stringify(data, null, 2);
@@ -825,7 +976,7 @@ def run(df):
     const isAr = check.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(check.LABEL || '');
     let ids = check.APP_IDS || [];
     let cnt = check.CNT;
-    if (isAr && hasDecisions) {
+    if (isAr && hasDecisions && flipsCovered) {
       const failed = applications
         .filter((a) => a.beforeDecision === 'APPROVE' && a.afterDecision !== 'APPROVE')
         .map((a) => a.app_id);
@@ -1010,7 +1161,7 @@ def run(df):
 
   // Одна строка таблицы проверок (обычная или вложенный срез внутри группы)
   const renderCheckRow = (c, key, nested) => {
-    const hasAppIds = c.APP_IDS.length > 0 || (hasDecisions && c.RESULT === 'FAIL' && (c.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(c.LABEL || '')));
+    const hasAppIds = c.APP_IDS.length > 0 || (hasDecisions && flipsCovered && c.RESULT === 'FAIL' && (c.CHECK_ID === 'ar_drop_by_product' || /approval\s*rate/i.test(c.LABEL || '')));
     const code = REPO_PYTHON_SCRIPTS[c.CHECK_ID];
     return (
       <tr key={key} className={nested ? 'bg-slate-50/70' : 'hover:bg-slate-50 transition'}>
@@ -1075,6 +1226,45 @@ def run(df):
   const runOptions = availableRuns.length > 0 ? availableRuns : [{ id: 'demo', status: 'demo', config: { runTag: 'демо-данные' } }];
   const isFallback = apiStatus === 'fallback';
 
+  if (!session) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 font-sans antialiased text-slate-900">
+        <form onSubmit={handleLogin} className="bg-white rounded-2xl border border-slate-200 shadow-xl w-full max-w-sm p-6 space-y-4">
+          <div>
+            <h1 className="text-base font-extrabold text-slate-900">СПР • Аудит кредитных стратегий</h1>
+            <p className="text-xs text-slate-500 mt-1">Введите логин аналитика. Пароль не нужен.</p>
+          </div>
+          <input
+            autoFocus
+            value={loginName}
+            onChange={(e) => setLoginName(e.target.value)}
+            placeholder="Логин"
+            className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm font-mono"
+          />
+          {loginError && <div className="text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{loginError}</div>}
+          <button
+            type="submit"
+            disabled={loginBusy || !loginName.trim()}
+            className="w-full py-2 rounded-lg bg-slate-900 hover:bg-blue-600 disabled:bg-slate-300 text-white text-sm font-semibold transition cursor-pointer"
+          >
+            {loginBusy ? 'Входим…' : 'Войти'}
+          </button>
+          <div className="flex items-center justify-between text-[11px] text-slate-500">
+            <span className="inline-flex items-center gap-1.5">
+              <span className={`w-2 h-2 rounded-full ${apiStatus === 'connected' ? 'bg-emerald-500' : apiStatus === 'fallback' ? 'bg-amber-500' : 'bg-slate-400'}`} />
+              {apiStatus === 'connected' ? 'ONLINE' : apiStatus === 'fallback' ? 'FALLBACK' : 'проверяем бэкенд…'}
+            </span>
+            {apiStatus === 'fallback' && (
+              <button type="button" onClick={() => saveSession({ demo: true, username: 'demo' })} className="underline hover:text-slate-800 cursor-pointer">
+                Продолжить в demo-режиме
+              </button>
+            )}
+          </div>
+        </form>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50/70 text-slate-900 font-sans flex flex-col antialiased">
       {/* ШАПКА */}
@@ -1134,34 +1324,22 @@ def run(df):
         </nav>
 
         <div className="flex items-center gap-2 text-xs">
-          <div className="flex items-center bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-sm">
-            <span className="text-slate-400 mr-1.5">👤</span>
-            <select
-              value={currentUser.id}
-              onChange={(e) => {
-                const f = analysts.find((a) => a.id === e.target.value);
-                if (f) setCurrentUser(f);
-              }}
-              className="bg-transparent border-none outline-none font-semibold text-slate-700 cursor-pointer"
-            >
-              {analysts.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.name}
-                </option>
-              ))}
-            </select>
+          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-2.5 py-1 shadow-sm">
+            <span className="text-slate-400">👤</span>
+            <span className="font-semibold text-slate-700 font-mono">{currentUser.username}</span>
+            {session?.demo && <span className="text-[10px] text-amber-700 bg-amber-100 px-1.5 rounded">demo</span>}
+            <button onClick={() => saveSession(null)} className="text-slate-400 hover:text-slate-800 cursor-pointer" title="Выйти">
+              Выйти
+            </button>
           </div>
           <button
-            onClick={() => setIsAddCheckOpen(true)}
+            onClick={() => {
+              setCcError(null);
+              setIsAddCheckOpen(true);
+            }}
             className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
           >
             + Проверка
-          </button>
-          <button
-            onClick={() => setIsAddUserModalOpen(true)}
-            className="px-2.5 py-1 rounded-lg font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 transition cursor-pointer"
-          >
-            + Аналитик
           </button>
           <button
             onClick={handleDownloadReport}
@@ -1205,7 +1383,7 @@ def run(df):
               <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Анкет с расхождениями</div>
               <div className="flex items-baseline justify-between mt-1">
                 <div className="text-2xl font-extrabold text-blue-600 font-mono">{changedApps.toLocaleString('ru-RU')}</div>
-                <span className="text-xs text-slate-500 font-mono">из {applications.length.toLocaleString('ru-RU')} в реестре</span>
+                <span className="text-xs text-slate-500 font-mono">из {portfolioSize.toLocaleString('ru-RU')} в выборке</span>
               </div>
             </div>
           </div>
@@ -1357,7 +1535,9 @@ def run(df):
             <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
               <div className="px-5 py-3 bg-slate-50 border-b border-slate-200">
                 <h3 className="text-sm font-bold text-slate-800">Пользовательские проверки</h3>
-                <p className="text-[11px] text-slate-500">Сохранены в браузере. Бэкенд их пока не запускает, статус «Не запускалась».</p>
+                <p className="text-[11px] text-slate-500">
+                  Выполняются на бэкенде по данным прогона #{runId}. Сами проверки хранятся в браузере.
+                </p>
               </div>
               <table className="w-full text-xs text-left">
                 <thead className="text-[11px] uppercase text-slate-500 bg-white border-b border-slate-100">
@@ -1365,35 +1545,116 @@ def run(df):
                     <th className="py-2 px-4">Название</th>
                     <th className="py-2 px-4">Модуль</th>
                     <th className="py-2 px-4 text-center">Порог</th>
+                    <th className="py-2 px-4 text-center">Затронуто</th>
+                    <th className="py-2 px-4 text-center">Метрика</th>
                     <th className="py-2 px-4 text-center">Статус</th>
                     <th className="py-2 px-4 text-right">Действия</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {customChecks.map((c) => (
-                    <tr key={c.id}>
-                      <td className="py-2.5 px-4 font-semibold text-slate-800">{c.name}</td>
-                      <td className="py-2.5 px-4 font-mono text-slate-600">{c.module || '—'}</td>
-                      <td className="py-2.5 px-4 text-center font-mono">{c.threshold || '—'}</td>
-                      <td className="py-2.5 px-4 text-center">
-                        <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[11px]">Не запускалась</span>
-                      </td>
-                      <td className="py-2.5 px-4 text-right space-x-2">
-                        <button
-                          onClick={() => setCodeModal({ isOpen: true, title: c.name, code: c.code })}
-                          className="px-2 py-1 rounded bg-slate-900 text-white text-[11px] font-semibold cursor-pointer"
-                        >
-                          Код
-                        </button>
-                        <button
-                          onClick={() => setCustomChecks((list) => list.filter((x) => x.id !== c.id))}
-                          className="px-2 py-1 rounded bg-white border border-rose-300 text-rose-700 text-[11px] font-semibold cursor-pointer"
-                        >
-                          Удалить
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {customChecks.map((c) => {
+                    const run = customRuns[c.id];
+                    const rows = run?.status === 'done' ? run.rows : [];
+                    const overall = run?.status === 'done' ? (rows.length === 0 ? 'EMPTY' : rows.some((r) => r.RESULT === 'FAIL') ? 'FAIL' : 'PASS') : run?.status === 'error' ? 'ERROR' : run?.status === 'running' ? 'RUNNING' : 'NONE';
+                    const maxCnt = rows.reduce((m, r) => Math.max(m, r.CNT), 0);
+                    const maxMetric = rows.reduce((m, r) => (r.METRIC !== null && r.METRIC > m ? r.METRIC : m), 0);
+                    const badge = {
+                      FAIL: 'bg-rose-100 text-rose-800',
+                      PASS: 'bg-emerald-100 text-emerald-800',
+                      ERROR: 'bg-rose-100 text-rose-800',
+                      RUNNING: 'bg-blue-100 text-blue-800',
+                      EMPTY: 'bg-amber-100 text-amber-800',
+                      NONE: 'bg-slate-100 text-slate-600'
+                    }[overall];
+                    const label = { FAIL: 'FAIL', PASS: 'PASS', ERROR: 'Ошибка', RUNNING: 'Выполняется…', EMPTY: 'Нет результата', NONE: 'Не запускалась' }[overall];
+                    const investigate = (row) => {
+                      if (!row.APP_IDS.length) return;
+                      setActiveInvestigateCheck({ label: row.LABEL, argument: row.ARGUMENT, appIds: row.APP_IDS, cnt: row.CNT });
+                      setRegistryStatusFilter('ALL');
+                      setSelectedPivotFilter(null);
+                      setRegistryLimit(APPS_PAGE);
+                      setActiveTab('registry');
+                    };
+                    return (
+                      <React.Fragment key={c.id}>
+                        <tr>
+                          <td className="py-2.5 px-4 font-semibold text-slate-800">{c.name}</td>
+                          <td className="py-2.5 px-4 font-mono text-slate-600">{c.module || '—'}</td>
+                          <td className="py-2.5 px-4 text-center font-mono">{c.threshold || '—'}</td>
+                          <td className="py-2.5 px-4 text-center font-mono font-bold">{rows.length ? (rows.length > 1 ? `до ${maxCnt}` : maxCnt) : '—'}</td>
+                          <td className="py-2.5 px-4 text-center font-mono">{rows.length ? fmtPct(maxMetric) : '—'}</td>
+                          <td className="py-2.5 px-4 text-center">
+                            <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${badge}`}>{label}</span>
+                          </td>
+                          <td className="py-2.5 px-4 text-right space-x-2 whitespace-nowrap">
+                            <button
+                              onClick={() => runCustomCheck(c)}
+                              disabled={overall === 'RUNNING' || apiStatus !== 'connected' || !runId}
+                              className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-[11px] font-semibold cursor-pointer disabled:cursor-not-allowed"
+                            >
+                              ▶ Запустить
+                            </button>
+                            <button
+                              onClick={() => setCodeModal({ isOpen: true, title: c.name, code: c.code })}
+                              className="px-2 py-1 rounded bg-slate-900 text-white text-[11px] font-semibold cursor-pointer"
+                            >
+                              Код
+                            </button>
+                            <button
+                              onClick={() => {
+                                setCustomChecks((list) => list.filter((x) => x.id !== c.id));
+                                setCustomRuns((m) => {
+                                  const { [c.id]: _drop, ...rest } = m;
+                                  return rest;
+                                });
+                              }}
+                              className="px-2 py-1 rounded bg-white border border-rose-300 text-rose-700 text-[11px] font-semibold cursor-pointer"
+                            >
+                              Удалить
+                            </button>
+                          </td>
+                        </tr>
+                        {run?.status === 'error' && (
+                          <tr>
+                            <td colSpan={7} className="px-4 py-2 bg-rose-50">
+                              <pre className="text-[11px] text-rose-900 whitespace-pre-wrap break-words font-mono">{run.error}</pre>
+                            </td>
+                          </tr>
+                        )}
+                        {rows.length > 1 &&
+                          rows.map((r, i) => (
+                            <tr key={`${c.id}-${i}`} className="bg-slate-50/70">
+                              <td className="py-2 px-4 pl-8 text-slate-700">{r.LABEL}</td>
+                              <td className="py-2 px-4 font-mono text-slate-500" colSpan={2}>{r.ARGUMENT || '—'}</td>
+                              <td className="py-2 px-4 text-center font-mono">
+                                {r.APP_IDS.length ? (
+                                  <button onClick={() => investigate(r)} className="px-2 py-0.5 rounded bg-blue-50 hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-300 font-bold cursor-pointer">
+                                    🔍 {r.CNT}
+                                  </button>
+                                ) : (
+                                  r.CNT
+                                )}
+                              </td>
+                              <td className="py-2 px-4 text-center font-mono">{r.METRIC === null ? '—' : fmtPct(r.METRIC)}</td>
+                              <td className="py-2 px-4 text-center">
+                                <span className={`px-2 py-0.5 rounded text-[11px] font-bold ${r.RESULT === 'FAIL' ? 'bg-rose-100 text-rose-800' : 'bg-emerald-100 text-emerald-800'}`}>{r.RESULT}</span>
+                              </td>
+                              <td />
+                            </tr>
+                          ))}
+                        {rows.length === 1 && rows[0].APP_IDS.length > 0 && (
+                          <tr className="bg-slate-50/70">
+                            <td colSpan={7} className="py-2 px-4 pl-8 text-[11px] text-slate-600">
+                              {rows[0].ARGUMENT && <span className="font-mono mr-3">{rows[0].ARGUMENT}</span>}
+                              <button onClick={() => investigate(rows[0])} className="px-2 py-0.5 rounded bg-blue-50 hover:bg-blue-600 hover:text-white text-blue-700 border border-blue-300 font-bold cursor-pointer">
+                                🔍 Открыть {rows[0].CNT} анкет в реестре ➔
+                              </button>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1728,7 +1989,7 @@ def run(df):
               <div>
                 <h3 className="text-base font-bold text-slate-800">Реестр кредитных заявок (Прогон #{runId})</h3>
                 <p className="text-xs text-slate-500">
-                  Подходит: <b>{filteredApps.length}</b> из {applications.length} анкет · сверху заявки с наибольшим риском и числом расхождений
+                  Подходит: <b>{filteredApps.length}</b> из {applications.length} анкет · сверху заявки с наибольшим риском и числом расхождений{applications.length < portfolioSize && ` · в реестре только заявки с расхождениями (всего в выборке ${portfolioSize.toLocaleString('ru-RU')})`}
                 </p>
               </div>
               {selectedPivotFilter && !activeInvestigateCheck && (
@@ -1863,6 +2124,79 @@ def run(df):
               Аналитик: <b>{currentUser.name}</b> (логин: {currentUser.username}
               {currentUser.backendId ? `, ID на бэке: ${currentUser.backendId}` : ''})
             </p>
+            <div className="border border-slate-200 rounded-xl p-4 space-y-3 bg-slate-50/60">
+              <div className="flex justify-between items-center">
+                <h4 className="text-xs font-bold text-slate-800">Свои входные данные (необязательно)</h4>
+                {uploadedDataset && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUploadedDataset(null);
+                      setBeforeFiles([]);
+                      setAfterFiles([]);
+                      setDsName('');
+                    }}
+                    className="text-[11px] text-slate-500 hover:text-slate-800 underline cursor-pointer"
+                  >
+                    Сбросить
+                  </button>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Выберите JSON-файлы заявок «до» (MASTER) и «после» (BETA). Имена файлов должны совпадать: пара определяется по имени.
+              </p>
+              <input
+                type="text"
+                value={dsName}
+                onChange={(e) => setDsName(e.target.value)}
+                placeholder="Название набора данных"
+                className="w-full border border-slate-300 rounded-lg px-3 py-1.5 text-xs outline-none focus:border-blue-500"
+              />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label className="block text-[11px] text-slate-600">
+                  BEFORE (MASTER), {beforeFiles.length} файлов
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    multiple
+                    onChange={(e) => setBeforeFiles(jsonOnly(e.target.files))}
+                    className="mt-1 block w-full text-[11px]"
+                  />
+                </label>
+                <label className="block text-[11px] text-slate-600">
+                  AFTER (BETA), {afterFiles.length} файлов
+                  <input
+                    type="file"
+                    accept=".json,application/json"
+                    multiple
+                    onChange={(e) => setAfterFiles(jsonOnly(e.target.files))}
+                    className="mt-1 block w-full text-[11px]"
+                  />
+                </label>
+              </div>
+              {(beforeFiles.length > 0 || afterFiles.length > 0) && (
+                <p className="text-[11px] text-slate-600">
+                  Пар: <b>{pairInfo.paired}</b>
+                  {pairInfo.onlyBefore > 0 && <span className="text-amber-700"> · без пары в AFTER: {pairInfo.onlyBefore}</span>}
+                  {pairInfo.onlyAfter > 0 && <span className="text-amber-700"> · без пары в BEFORE: {pairInfo.onlyAfter}</span>}
+                </p>
+              )}
+              {uploadError && <div className="bg-rose-50 border border-rose-200 text-rose-900 text-xs rounded-lg px-3 py-2 break-words">{uploadError}</div>}
+              {uploadedDataset && (
+                <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 text-xs rounded-lg px-3 py-2">
+                  Загружено, пар: {uploadedDataset.pairs}. Следующий прогон возьмёт набор «{uploadedDataset.config.datasetName}».
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={uploadDataset}
+                disabled={uploadBusy || isFallback || beforeFiles.length === 0 || afterFiles.length === 0}
+                className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-blue-600 text-white transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {uploadBusy ? 'Загружаем…' : '⬆ Загрузить данные'}
+              </button>
+            </div>
+
             <label className="block text-xs text-slate-600">
               Метка прогона (runTag)
               <input
@@ -2026,38 +2360,6 @@ def run(df):
         </div>
       )}
 
-      {/* МОДАЛКА АНАЛИТИКА */}
-      {isAddUserModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!newUserName.trim() || !newUserUsername.trim()) return;
-              const a = { id: String(Date.now()), name: newUserName.trim(), username: newUserUsername.trim(), role: newUserRole };
-              setAnalysts((list) => [...list, a]);
-              setCurrentUser(a);
-              setNewUserName('');
-              setNewUserUsername('');
-              setIsAddUserModalOpen(false);
-            }}
-            className="bg-white rounded-2xl p-6 w-full max-w-sm space-y-4 shadow-xl border border-slate-200"
-          >
-            <h3 className="font-bold text-sm text-slate-800">Создать профиль аналитика</h3>
-            <input type="text" required placeholder="ФИО" value={newUserName} onChange={(e) => setNewUserName(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs" />
-            <input type="text" required placeholder="Логин (username на бэкенде)" value={newUserUsername} onChange={(e) => setNewUserUsername(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs font-mono" />
-            <input type="text" placeholder="Должность" value={newUserRole} onChange={(e) => setNewUserRole(e.target.value)} className="w-full border border-slate-300 rounded-lg p-2 text-xs" />
-            <div className="flex justify-end gap-2 pt-2 text-xs">
-              <button type="button" onClick={() => setIsAddUserModalOpen(false)} className="px-3 py-1.5 text-slate-600 cursor-pointer">
-                Отмена
-              </button>
-              <button type="submit" className="px-4 py-1.5 font-semibold bg-slate-900 text-white rounded-lg cursor-pointer">
-                Создать
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
       {/* МОДАЛКА: НОВАЯ ПРОВЕРКА */}
       {isAddCheckOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
@@ -2065,10 +2367,18 @@ def run(df):
             onSubmit={(e) => {
               e.preventDefault();
               if (!ccName.trim()) return;
-              setCustomChecks((list) => [
-                ...list,
-                { id: String(Date.now()), name: ccName.trim(), module: ccModule.trim(), threshold: ccThreshold.trim(), code: ccCode }
-              ]);
+              if (ccThreshold.trim() && parseThreshold(ccThreshold) === null) {
+                setCcError('Порог: число или процент, например 5% или 0.05.');
+                return;
+              }
+              if (!/def\s+run\s*\(/.test(ccCode)) {
+                setCcError('В коде должна быть функция def run(df): ...');
+                return;
+              }
+              const created = { id: String(Date.now()), name: ccName.trim(), module: ccModule.trim(), threshold: ccThreshold.trim(), code: ccCode };
+              setCustomChecks((list) => [...list, created]);
+              runCustomCheck(created);
+              setCcError(null);
               setCcName('');
               setCcModule('');
               setCcThreshold('');
@@ -2126,7 +2436,11 @@ def run(df):
                   <CodeMirror value={ccCode} height="260px" theme="dark" extensions={[python()]} onChange={(v) => setCcCode(v)} />
                 </div>
               </div>
-              <p className="text-[11px] text-slate-500">Проверка сохранится в браузере. Запуск на бэкенде появится, когда у него будет эндпоинт для новых проверок.</p>
+              {ccError && <div className="text-xs text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{ccError}</div>}
+              <p className="text-[11px] text-slate-500">
+                Проверка выполнится на бэкенде по данным выбранного прогона. Порог сравнивается с долей затронутых заявок (cnt / total): выше порога — FAIL.
+                Без порога FAIL, если cnt больше нуля.
+              </p>
             </div>
             <div className="px-5 py-3 border-t border-slate-200 flex justify-end gap-2 bg-slate-50">
               <button type="button" onClick={() => setIsAddCheckOpen(false)} className="px-4 py-1.5 text-xs text-slate-700 bg-white border border-slate-300 rounded-lg cursor-pointer">
