@@ -212,30 +212,36 @@ class CustomCheckPayload(BaseModel):
 @router.post("/{run_id}/checks/custom")
 def run_custom_check(run_id: int, payload: CustomCheckPayload, db: Session = Depends(get_db)):
     try:
-        # 1. Подключаем интерфейс MartAPI (из папки аналитики)
+        # 1. Подключаем MartAPI
         from checks_runner import MartAPI
-        
-        # 2. Формируем окружение и выполняем пользовательский код
-        local_vars = {}
-        exec(payload.code, {}, local_vars)
-        
-        if "CHECK" not in local_vars:
-            raise HTTPException(status_code=400, detail="В коде не найден объект CHECK")
-            
-        check_info = local_vars["CHECK"]
-        entrypoint = check_info.get("entrypoint")
-        if not entrypoint:
-            raise HTTPException(status_code=400, detail="В объекте CHECK отсутствует entrypoint")
-            
-        # 3. Получаем путь к базе для MartAPI
         db_path = SQLALCHEMY_DATABASE_URL.replace("sqlite:///", "")
         mart = MartAPI(db_path, run_id)
+
+        # 2. Выполняем код в ЕДИНОМ пространстве имен
+        namespace = {}
+        exec(payload.code, namespace)
+
+        if "CHECK" not in namespace:
+            raise ValueError("В загруженном коде не найден объект CHECK")
+
+        check_info = namespace["CHECK"]
         
-        # 4. Запускаем проверку
+        # Ищем entrypoint (внутри CHECK или просто функция run)
+        entrypoint = check_info.get("entrypoint")
+        if not entrypoint and "run" in namespace:
+            entrypoint = namespace["run"]
+            
+        if not entrypoint:
+            raise ValueError("Не найдена функция для запуска (entrypoint или run)")
+
+        # 3. Запускаем проверку
         params = check_info.get("params", {})
-        check_results = entrypoint(mart, params)
-        
-        # 5. Сохраняем в БД
+        try:
+            check_results = entrypoint(mart, params)
+        except Exception as e:
+            raise ValueError(f"Ошибка внутри кода проверки: {str(e)}")
+
+        # 4. Сохраняем в БД
         saved_rows = []
         for r in check_results:
             db_check = models.CheckResult(
@@ -255,7 +261,8 @@ def run_custom_check(run_id: int, payload: CustomCheckPayload, db: Session = Dep
         
         db.commit()
         return {"status": "success", "message": f"Выполнено, сохранено строк: {len(saved_rows)}"}
-        
+
     except Exception as e:
         print(f"Custom Check Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        # Возвращаем 400 (Bad Request), чтобы фронт показал ошибку валидации, а не падение сервера
+        raise HTTPException(status_code=400, detail=str(e))
