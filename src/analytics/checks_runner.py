@@ -75,9 +75,11 @@ class MartAPI:
         if diff_flag is not None:
             mask &= df["diff_flag"] == int(diff_flag)
         if value_before is not None:
-            mask &= df["value_before"].astype(object) == value_before
+            vb_target = str(value_before).lower()
+            mask &= df["value_before"].astype(str).str.lower() == vb_target
         if value_after is not None:
-            mask &= df["value_after"].astype(object) == value_after
+            va_target = str(value_after).lower()
+            mask &= df["value_after"].astype(str).str.lower() == va_target
         if app_ids is not None:
             mask &= df["app_id"].isin(list(app_ids))
         return df.loc[mask]

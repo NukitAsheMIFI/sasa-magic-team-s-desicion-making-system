@@ -4,19 +4,17 @@ from normalize import normalize_file
 
 def compare_dataframes(df_before, df_after):
     """
-    Сопоставляет строки BEFORE и AFTER по ключу (APP_ID, PATH, ARRAY_KEY)
-    и определяет тип изменения (CHANGE_TYPE) и флаг различия (DIFF_FLAG).
+    Сопоставляет строки срезов BEFORE и AFTER по ключу (APP_ID, PATH, ARRAY_KEY)
+    и размечает 4 типа изменений (CHANGE_TYPE) и флаг различия (DIFF_FLAG).
     """
-    # 1. Если данные пришли в виде списка словарей, превращаем их в DataFrame
     if isinstance(df_before, list):
         df_before = pd.DataFrame(df_before)
     if isinstance(df_after, list):
         df_after = pd.DataFrame(df_after)
 
-    # 2. Выбираем ключевые колонки, по которым сопоставляем строки
-    join_keys = ["APP_ID", "PREFIX", "CLASS", "SUFFIX", "ARRAY_KEY", "KEY"]
+    # Используем чистый PATH прямо из нормализатора для точного сопоставления
+    join_keys = ["APP_ID", "PATH", "PREFIX", "CLASS", "SUFFIX", "ARRAY_KEY", "KEY"]
 
-    # 3. Делаем полное внешнее соединение (Full Outer Join)
     merged = pd.merge(
         df_before,
         df_after,
@@ -25,23 +23,12 @@ def compare_dataframes(df_before, df_after):
         suffixes=("_BEFORE", "_AFTER")
     )
 
-    # Заполняем пропуски пустыми строками для удобного сравнения
     merged["VALUE_BEFORE"] = merged["VALUE_BEFORE"].fillna("")
     merged["VALUE_AFTER"] = merged["VALUE_AFTER"].fillna("")
     merged["ADJUSTED_BEFORE"] = merged["ADJUSTED_VALUE_BEFORE"].fillna("")
     merged["ADJUSTED_AFTER"] = merged["ADJUSTED_VALUE_AFTER"].fillna("")
 
-    # 4. Собираем полный путь PATH
-    def build_path(row):
-        parts = [row["PREFIX"], row["CLASS"]]
-        if row["SUFFIX"]:
-            parts.append(row["SUFFIX"])
-        parts.append(row["KEY"])
-        return ".".join([p for p in parts if p])
-
-    merged["PATH"] = merged.apply(build_path, axis=1)
-
-    # 5. Определяем CHANGE_TYPE (4 типа изменений) и DIFF_FLAG
+    # Классификация 4 типов изменений
     change_types = []
     diff_flags = []
 
@@ -68,7 +55,6 @@ def compare_dataframes(df_before, df_after):
     merged["CHANGE_TYPE"] = change_types
     merged["DIFF_FLAG"] = diff_flags
 
-    # 6. Оставляем только те колонки, которые требует целевой контракт витрины
     target_columns = [
         "APP_ID", "PREFIX", "CLASS", "SUFFIX", "ARRAY_KEY", "KEY", "PATH",
         "VALUE_BEFORE", "VALUE_AFTER", "ADJUSTED_BEFORE", "ADJUSTED_AFTER",

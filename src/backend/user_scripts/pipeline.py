@@ -27,11 +27,22 @@ def extract_app_segment(app_id, df_b, df_a):
     all_prods = sorted(list(set(map(str, prod_b + prod_a))))
     products_str = ";".join(all_prods)
 
-    # Модели и отсечки для проверки check_target_model_changed
-    model_b = get_val(df_b, "modelName")
-    model_a = get_val(df_a, "modelName")
-    cutoff_b = get_val(df_b, "cutoff")
-    cutoff_a = get_val(df_a, "cutoff")
+    # 1. Модели скоринга: ищем модель именно в целевом блоке pd
+    def get_pd_model(df):
+        sub = df[(df["KEY"] == "modelName") & (df["CLASS"] == "pd")]
+        if sub.empty:
+            sub = df[df["KEY"] == "modelName"]
+        return str(sub["VALUE"].iloc[0]) if not sub.empty and pd.notna(sub["VALUE"].iloc[0]) else ""
+
+    # 2. Порог отсечки: ищем cutOff / cutoff без учета регистра
+    def get_cutoff(df):
+        sub = df[df["KEY"].str.lower() == "cutoff"]
+        return str(sub["VALUE"].iloc[0]) if not sub.empty and pd.notna(sub["VALUE"].iloc[0]) else ""
+
+    model_b = get_pd_model(df_b)
+    model_a = get_pd_model(df_a)
+    cutoff_b = get_cutoff(df_b)
+    cutoff_a = get_cutoff(df_a)
 
     return {
         "APP_ID": str(app_id),

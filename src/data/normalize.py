@@ -2,7 +2,7 @@ import os
 import json
 import pandas as pd
 
-# Технические поля исключаем сразу чтобы не ловить шум
+# Технические поля исключаем сразу, чтобы не ловить шум
 EXCLUDE_PATHS = {
     "appData.request_id",
     "appData.createDateTime",
@@ -23,6 +23,7 @@ ARRAY_KEY_RULES = {
 }
 
 def get_bucket(val, path):
+    """Категоризация числовых показателей по бакетам для витрины и сводной таблицы."""
     if val is None or val == "":
         return ""
     try:
@@ -40,38 +41,54 @@ def get_bucket(val, path):
     return str(val)
 
 def _emit_row(rows, app_id, source, path_segments, array_keys, value):
+    """Формирует нормализованную строку плоской витрины с чистыми уровнями пути."""
     full_path = ".".join(path_segments)
     if full_path in EXCLUDE_PATHS:
         return
 
     prefix = path_segments[0] if len(path_segments) > 0 else ""
-    class_name = path_segments[1] if len(path_segments) > 1 else ""
     key = path_segments[-1] if len(path_segments) > 0 else ""
 
-    if len(path_segments) > 3:
-        suffix = ".".join(path_segments[2:-1])
+    # Корректное выделение CLASS и SUFFIX без дублирования ключей
+    if len(path_segments) == 2:
+        class_name = ""
+        suffix = ""
     elif len(path_segments) == 3:
-        suffix = path_segments[2]
+        class_name = path_segments[1]
+        suffix = ""
+    elif len(path_segments) > 3:
+        class_name = path_segments[1]
+        suffix = ".".join(path_segments[2:-1])
     else:
+        class_name = ""
         suffix = ""
 
-    val_str = "" if value is None else str(value)
+    # Приведение булевых типов строго к стандарту JSON ("true" / "false")
+    if isinstance(value, bool):
+        val_str = "true" if value else "false"
+    elif value is None:
+        val_str = ""
+    else:
+        val_str = str(value)
+
     adj_val = get_bucket(value, full_path)
     arr_key = "|".join(array_keys) if array_keys else ""
 
     rows.append({
-        "APP_ID": app_id,
+        "APP_ID": str(app_id),
         "SOURCE": source,
         "PREFIX": prefix,
         "CLASS": class_name,
         "SUFFIX": suffix,
         "ARRAY_KEY": arr_key,
         "KEY": key,
+        "PATH": full_path,
         "VALUE": val_str,
         "ADJUSTED_VALUE": adj_val
     })
 
 def flatten_json_recursive(node, path_segments, array_keys, rows, app_id, source):
+    """Рекурсивный спуск (DFS) по дереву любой вложенности."""
     current_path = ".".join(path_segments)
     if current_path in EXCLUDE_PATHS:
         return
@@ -86,8 +103,8 @@ def flatten_json_recursive(node, path_segments, array_keys, rows, app_id, source
                 elem_key = str(idx)
             elif current_path in ARRAY_KEY_RULES:
                 elem_key = ARRAY_KEY_RULES[current_path](item)
-            elif isinstance(item, (str, int, float)):
-                elem_key = str(item)
+            elif isinstance(item, (str, int, float, bool)):
+                elem_key = str(item).lower() if isinstance(item, bool) else str(item)
             else:
                 elem_key = str(idx)
 
@@ -97,13 +114,16 @@ def flatten_json_recursive(node, path_segments, array_keys, rows, app_id, source
                 for k, v in item.items():
                     flatten_json_recursive(v, path_segments + [k], new_arr_keys, rows, app_id, source)
             else:
-                _emit_row(rows, app_id, source, path_segments, new_arr_keys, str(item))
+                _emit_row(rows, app_id, source, path_segments, new_arr_keys, item)
 
     else:
         _emit_row(rows, app_id, source, path_segments, array_keys, node)
 
 def normalize_file(file_path, source="BEFORE", app_id=None):
-    # Если app_id не передали (как в старой версии), берем его из имени файла
+    """
+    Принимает путь к JSON-файлу.
+    Если app_id не передан явно, извлекает его из имени файла.
+    """
     if app_id is None:
         app_id = os.path.splitext(os.path.basename(file_path))[0]
     with open(file_path, "r", encoding="utf-8") as f:
