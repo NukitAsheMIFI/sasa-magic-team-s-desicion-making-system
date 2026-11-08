@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 import pandas as pd
+import json
 from database import get_db, SessionLocal # Импортируем фабрику сессий
 import models, schemas
 import datetime
@@ -183,6 +184,34 @@ def run_pipeline(run_id: int, config: dict):
                 else:
                     print("ВНИМАНИЕ: файл segments.csv не найден по пути", seg_file)
                 # ---------------------------
+                                # --- ЗАГРУЗКА БИЗНЕС-ВЕРДИКТА ---
+                print("Загрузка бизнес-вердикта...")
+                verdict_file = res["out_file"].replace(".csv", "_verdict.json")
+                
+                if os.path.exists(verdict_file):
+                    with open(verdict_file, "r", encoding="utf-8") as vf:
+                        v_data = json.load(vf)
+                        
+                        # Проверяем, нет ли уже вердикта для этого запуска (чтобы не было дублей)
+                        existing_verdict = db.query(models.Verdict).filter(models.Verdict.run_id == run_id).first()
+                        if not existing_verdict:
+                            db_verdict = models.Verdict(
+                                run_id=run_id,
+                                total_apps=v_data.get("total_apps", 0),
+                                ar_before=v_data.get("ar_before", 0.0),
+                                ar_after=v_data.get("ar_after", 0.0),
+                                new_approved=v_data.get("new_approved", 0),
+                                lost_approved=v_data.get("lost_approved", 0),
+                                net_impact=v_data.get("net_impact", 0),
+                                summary=v_data.get("summary", "")
+                            )
+                            db.add(db_verdict)
+                            db.commit()
+                    print("Бизнес-вердикт успешно загружен в БД!")
+                else:
+                    print(f"ВНИМАНИЕ: файл вердикта не найден по пути {verdict_file}")
+                # --------------------------------
+
 
             elif step_name == "checks":
                 import sys
