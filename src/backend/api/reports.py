@@ -1,6 +1,6 @@
 import sys
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, literal
@@ -37,23 +37,27 @@ def get_pivot_facts(run_id: int, db: Session = Depends(get_db)):
 
 # 2. РЕЕСТР ЗАЯВОК (Applications Registry)
 @router.get("/{run_id}/applications")
-def get_applications(run_id: int, db: Session = Depends(get_db)):
+def get_applications(
+    run_id: int, 
+    limit: int = Query(5000, description="Максимальное кол-во заявок"), 
+    offset: int = Query(0, description="Смещение (для пагинации)"),
+    db: Session = Depends(get_db)
+):
     try:
-        # Ищем заявки с изменениями (лимит 100)
+        # Убрали жесткий .limit(100), поставили динамические limit и offset
         results = db.query(
             models.MartRow.app_id,
             func.count(models.MartRow.id).label("diff_count")
         ).filter(
             models.MartRow.run_id == run_id,
             models.MartRow.diff_flag == 1
-        ).group_by(models.MartRow.app_id).limit(100).all()
+        ).group_by(models.MartRow.app_id).offset(offset).limit(limit).all()
 
         if not results:
             return []
 
         app_ids = [r.app_id for r in results]
 
-        # Достаем решения BEFORE и AFTER
         decisions = db.query(
             models.MartRow.app_id, 
             models.MartRow.value_before,
@@ -64,22 +68,20 @@ def get_applications(run_id: int, db: Session = Depends(get_db)):
             models.MartRow.key == "decision"
         ).all()
 
-        # Словарь: { 'I32554354': ('APPROVE', 'REJECT') }
         decision_map = {d.app_id: (d.value_before, d.value_after) for d in decisions}
 
         response = []
         for r in results:
             dec_b, dec_a = decision_map.get(r.app_id, (None, None))
             
-            # Очистка от NaN и None
             if dec_b is None or str(dec_b).lower() == 'nan': dec_b = "UNKNOWN"
             if dec_a is None or str(dec_a).lower() == 'nan': dec_a = "UNKNOWN"
                 
             response.append({
                 "app_id": str(r.app_id),
                 "diff_count": int(r.diff_count),
-                "beforeDecision": str(dec_b),   # Для фронтендера
-                "afterDecision": str(dec_a)     # Для фронтендера
+                "beforeDecision": str(dec_b),
+                "afterDecision": str(dec_a)
             })
         return response
         
@@ -87,7 +89,7 @@ def get_applications(run_id: int, db: Session = Depends(get_db)):
         print(f"ERROR in get_applications: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+    
 # 3. ДОСЬЕ ЗАЯВКИ (Drill-down)
 @router.get("/{run_id}/applications/{app_id}/diff")
 def get_app_diff(run_id: int, app_id: str, db: Session = Depends(get_db)):
