@@ -1,0 +1,6 @@
+﻿LABEL;SOURCE;ARGUMENT;CNT;TOTAL;METRIC;APP_IDS;RESULT;CONFIDENCE
+Изменился состав атрибутов;AFTER;;0;0;0.0;[];PASS;HIGH
+Различие вызвано входными данными;AFTER;characteristics.score_okb;0;0;0.0;[];PASS;HIGH
+Различие вызвано входными данными;AFTER;предиктор != источник;0;0;0.0;[];PASS;HIGH
+Стоп-фактор перестал работать;AFTER;;0;0;0.0;[];PASS;HIGH
+Сменилась целевая модель решения;AFTER;;0;0;0.0;[];PASS;HIGH

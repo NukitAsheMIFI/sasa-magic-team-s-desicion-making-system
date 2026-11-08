@@ -1,14 +1,5 @@
 """
 HTML-отчёт по запуску пайплайна.
-
-Источники данных:
-  - hackathon.db (SQLite):
-      users, runs, run_steps, mart_rows, pivot_facts
-  - verdict.json — файл, генерируется pipeline.py в той же папке,
-    что и mart.csv (по умолчанию src/data/RUN-*/RESULTS/verdict.json).
-    В БД его НЕТ — читаем с диска.
-  - checks — если в БД появится таблица 'checks' или 'check_results',
-    покажем её. Иначе выводим "Проверки не запущены".
 """
 
 import os
@@ -61,20 +52,12 @@ def _load_verdict(cur, run_id: int):
     return None, None
 
 def generate_html_report(run_id: int, db_path: str = None) -> str:
-    # Если путь к БД передан из FastAPI, используем его. Иначе ищем сами.
     if not db_path:
         db_path = _get_db_path()
         
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    
-    # ... (остальной код получения run, steps, apps, facts и checks остается без изменений) ...
-    
-    # А вот строчку с вердиктом меняем:
-    # БЫЛО: verdict, verdict_src = _load_verdict(run, run_id)
-    # СТАЛО:
-    verdict, verdict_src = _load_verdict(cur, run_id)
 
     # ---- Запуск + пользователь ----
     cur.execute("""
@@ -150,10 +133,11 @@ def generate_html_report(run_id: int, db_path: str = None) -> str:
         except Exception:
             checks = None
 
+    # Читаем вердикт из БД
+    verdict, verdict_src = _load_verdict(cur, run_id)
+    
     conn.close()
 
-    # ---- Вердикт: сначала verdict.json, потом fallback ----
-    verdict, verdict_src = _load_verdict(run, run_id)
     verdict_is_approx = False
 
     if verdict is None and decisions:
@@ -188,7 +172,6 @@ def generate_html_report(run_id: int, db_path: str = None) -> str:
         verdict_is_approx = True
 
     if verdict is None:
-        # Второй fallback: приближение по дифам
         total = len(apps)
         if total == 0:
             verdict = {
@@ -295,9 +278,27 @@ def generate_html_report(run_id: int, db_path: str = None) -> str:
         )
     else:
         keys = list(checks[0].keys())
+        if "id" in keys: keys.remove("id")
+        if "run_id" in keys: keys.remove("run_id")
+
         header = "".join(f"<th>{_e(k)}</th>" for k in keys)
+        
+        # УМНАЯ ФУНКЦИЯ: Прячет 30000 строк в аккуратную подсказку
+        def format_cell(k, v):
+            if v is None: return ""
+            if k == "app_ids":
+                try:
+                    lst = json.loads(v) if isinstance(v, str) and v.startswith("[") else v
+                    if isinstance(lst, list):
+                        # Показывает "273 заявок", а при наведении — первые 100
+                        preview = ", ".join(map(str, lst[:100]))
+                        return f"<span style='cursor:help; border-bottom: 1px dotted #0969da; color: #0969da' title='{_e(preview)}...'>{len(lst)} заявок</span>"
+                except Exception:
+                    pass
+            return _e(v)
+
         body = "".join(
-            "<tr>" + "".join(f"<td>{_e(c[k])}</td>" for k in keys) + "</tr>"
+            "<tr>" + "".join(f"<td>{format_cell(k, c[k])}</td>" for k in keys) + "</tr>"
             for c in checks
         )
         checks_block = (
