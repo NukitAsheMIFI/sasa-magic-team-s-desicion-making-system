@@ -8,11 +8,9 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      # Проброс датасета (2002 заявки) внутрь контейнера
-      - ./src/backend/user_scripts:/app/src/backend/user_scripts
+      - ./src/backend:/app/src/backend
       - ./src/data:/app/src/data
-      # Монтирование пользовательских скриптов и проверок
-      - ./src/scripts:/app/src/scripts
-      - ./src/analytics:/app/src/analytics
       - ./src/checks:/app/src/checks
+      - ./src/analytics:/app/src/analytics
+      - ./src/scripts:/app/src/scripts
     restart: unless-stopped
