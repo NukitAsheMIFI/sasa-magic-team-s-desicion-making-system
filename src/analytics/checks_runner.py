@@ -12,9 +12,11 @@ import sqlite3
 import pandas as pd
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SRC_DIR = os.path.abspath(os.path.join(BASE_DIR, ".."))
-DB_PATH = os.path.join(SRC_DIR, "backend", "hackathon.db")
-CHECKS_DIR = os.path.join(SRC_DIR, "checks")
+# Ищем базу данных в папке backend (поднимаемся на уровень выше из analytics)
+DB_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "backend", "hackathon.db"))
+# Ищем проверки в папке src/checks
+CHECKS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "checks"))
+
 
 class MartAPI:
     """5 методов контракта: rows / count / app_ids / segments / total_apps."""
