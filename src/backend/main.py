@@ -9,7 +9,7 @@ from database import engine, Base
 from api import runs, reports
 from database import engine
 import models
-from api import runs, reports, auth
+from api import runs, reports, auth, datasets
 
 Base.metadata.create_all(bind=engine)
 
@@ -29,6 +29,7 @@ app.include_router(reports.router, prefix="/api")
 app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
 app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 
 @app.get("/api/health")
 def health_check():

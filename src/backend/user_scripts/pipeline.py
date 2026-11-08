@@ -110,7 +110,7 @@ def main():
         "summary": "Ужесточение стратегии" if net_impact < 0 else "Экспансия портфеля"
     }
 
-    verdict_file = os.path.join(out_dir, "verdict.json")
+    verdict_file = out_file.replace(".csv", "_verdict.json")
     with open(verdict_file, "w", encoding="utf-8") as f:
         json.dump(verdict_data, f, ensure_ascii=False, indent=2)
 
