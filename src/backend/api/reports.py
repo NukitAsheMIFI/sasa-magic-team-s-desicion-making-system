@@ -1,12 +1,13 @@
 import sys
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, literal
 from database import SQLALCHEMY_DATABASE_URL
 from database import get_db
 import models
+from pydantic import BaseModel
 
 # Инициализация роутера
 router = APIRouter()
@@ -37,23 +38,27 @@ def get_pivot_facts(run_id: int, db: Session = Depends(get_db)):
 
 # 2. РЕЕСТР ЗАЯВОК (Applications Registry)
 @router.get("/{run_id}/applications")
-def get_applications(run_id: int, db: Session = Depends(get_db)):
+def get_applications(
+    run_id: int, 
+    limit: int = Query(5000, description="Максимальное кол-во заявок"), 
+    offset: int = Query(0, description="Смещение (для пагинации)"),
+    db: Session = Depends(get_db)
+):
     try:
-        # Ищем заявки с изменениями (лимит 100)
+        # Убрали жесткий .limit(100), поставили динамические limit и offset
         results = db.query(
             models.MartRow.app_id,
             func.count(models.MartRow.id).label("diff_count")
         ).filter(
             models.MartRow.run_id == run_id,
             models.MartRow.diff_flag == 1
-        ).group_by(models.MartRow.app_id).limit(100).all()
+        ).group_by(models.MartRow.app_id).offset(offset).limit(limit).all()
 
         if not results:
             return []
 
         app_ids = [r.app_id for r in results]
 
-        # Достаем решения BEFORE и AFTER
         decisions = db.query(
             models.MartRow.app_id, 
             models.MartRow.value_before,
@@ -64,22 +69,20 @@ def get_applications(run_id: int, db: Session = Depends(get_db)):
             models.MartRow.key == "decision"
         ).all()
 
-        # Словарь: { 'I32554354': ('APPROVE', 'REJECT') }
         decision_map = {d.app_id: (d.value_before, d.value_after) for d in decisions}
 
         response = []
         for r in results:
             dec_b, dec_a = decision_map.get(r.app_id, (None, None))
             
-            # Очистка от NaN и None
             if dec_b is None or str(dec_b).lower() == 'nan': dec_b = "UNKNOWN"
             if dec_a is None or str(dec_a).lower() == 'nan': dec_a = "UNKNOWN"
                 
             response.append({
                 "app_id": str(r.app_id),
                 "diff_count": int(r.diff_count),
-                "beforeDecision": str(dec_b),   # Для фронтендера
-                "afterDecision": str(dec_a)     # Для фронтендера
+                "beforeDecision": str(dec_b),
+                "afterDecision": str(dec_a)
             })
         return response
         
@@ -87,7 +90,7 @@ def get_applications(run_id: int, db: Session = Depends(get_db)):
         print(f"ERROR in get_applications: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
+    
 # 3. ДОСЬЕ ЗАЯВКИ (Drill-down)
 @router.get("/{run_id}/applications/{app_id}/diff")
 def get_app_diff(run_id: int, app_id: str, db: Session = Depends(get_db)):
@@ -198,3 +201,68 @@ def get_ai_summary(run_id: int, db: Session = Depends(get_db)):
         return {"status": "error", "summary": "Модуль ai_summary.py не найден в папке analytics."}
     except Exception as e:
         return {"status": "error", "summary": f"Ошибка генерации ИИ-мнения: {e}"}
+
+    from pydantic import BaseModel
+from database import SQLALCHEMY_DATABASE_URL
+
+class CustomCheckPayload(BaseModel):
+    name: str
+    code: str
+
+@router.post("/{run_id}/checks/custom")
+def run_custom_check(run_id: int, payload: CustomCheckPayload, db: Session = Depends(get_db)):
+    try:
+        # 1. Подключаем MartAPI
+        from checks_runner import MartAPI
+        db_path = SQLALCHEMY_DATABASE_URL.replace("sqlite:///", "")
+        mart = MartAPI(db_path, run_id)
+
+        # 2. Выполняем код в ЕДИНОМ пространстве имен
+        namespace = {}
+        exec(payload.code, namespace)
+
+        if "CHECK" not in namespace:
+            raise ValueError("В загруженном коде не найден объект CHECK")
+
+        check_info = namespace["CHECK"]
+        
+        # Ищем entrypoint (внутри CHECK или просто функция run)
+        entrypoint = check_info.get("entrypoint")
+        if not entrypoint and "run" in namespace:
+            entrypoint = namespace["run"]
+            
+        if not entrypoint:
+            raise ValueError("Не найдена функция для запуска (entrypoint или run)")
+
+        # 3. Запускаем проверку
+        params = check_info.get("params", {})
+        try:
+            check_results = entrypoint(mart, params)
+        except Exception as e:
+            raise ValueError(f"Ошибка внутри кода проверки: {str(e)}")
+
+        # 4. Сохраняем в БД
+        saved_rows = []
+        for r in check_results:
+            db_check = models.CheckResult(
+                run_id=run_id,
+                label=payload.name or r.get("LABEL", "Кастомная проверка"),
+                source=r.get("SOURCE", "AFTER"),
+                argument=r.get("ARGUMENT", ""),
+                cnt=r.get("CNT", 0),
+                total=r.get("TOTAL", 0),
+                metric=r.get("METRIC", 0.0),
+                result=r.get("RESULT", "PASS"),
+                confidence=r.get("CONFIDENCE", "HIGH"),
+                app_ids=r.get("APP_IDS", [])
+            )
+            db.add(db_check)
+            saved_rows.append(db_check)
+        
+        db.commit()
+        return {"status": "success", "message": f"Выполнено, сохранено строк: {len(saved_rows)}"}
+
+    except Exception as e:
+        print(f"Custom Check Error: {e}")
+        # Возвращаем 400 (Bad Request), чтобы фронт показал ошибку валидации, а не падение сервера
+        raise HTTPException(status_code=400, detail=str(e))

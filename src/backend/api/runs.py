@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
 from sqlalchemy.orm import Session
 import pandas as pd
+import json
 from database import get_db, SessionLocal # Импортируем фабрику сессий
 import models, schemas
 import datetime
@@ -43,21 +44,27 @@ def run_pipeline(run_id: int, config: dict):
                 script_path = "user_scripts/pipeline.py" 
                 
                 current_file = Path(__file__).resolve()
-                
-                # Находимся в src/backend/api/runs.py
-                # Поднимаемся на 3 уровня вверх: api -> backend -> src
+                # Находимся в src/backend/api/runs.py, поднимаемся до src
                 src_dir = current_file.parent.parent.parent
                 
-                # Теперь приклеиваем "data", так как она лежит внутри src
-                data_path = src_dir / "data" / "RUN-20260827-0001" / "RESULTS"
-                
                 print(f"\n!!! СТАРТ НОРМАЛИЗАЦИИ !!!")
-                print(f"Ищем данные в: {data_path}")
+                
+                # Проверяем: если фронтенд передал пути к загруженным файлам — используем их
+                if config and config.get("before_dir") and config.get("after_dir"):
+                    before_path = config["before_dir"]
+                    after_path = config["after_dir"]
+                    print(f"Используем загруженный датасет: {before_path}")
+                else:
+                    # Иначе берем стандартный датасет RUN-20260827-0001
+                    data_path = src_dir / "data" / "RUN-20260827-0001" / "RESULTS"
+                    before_path = str(data_path / "BEFORE_MASTER")
+                    after_path = str(data_path / "AFTER_BETA")
+                    print(f"Используем дефолтный датасет: {data_path}")
                 
                 input_args = {
                     "run_id": run_id,
-                    "before_dir": str(data_path / "BEFORE_MASTER"),
-                    "after_dir": str(data_path / "AFTER_BETA")
+                    "before_dir": str(before_path),
+                    "after_dir": str(after_path)
                 }
                 
                 # ВЫЗОВ СКРИПТА
@@ -183,6 +190,34 @@ def run_pipeline(run_id: int, config: dict):
                 else:
                     print("ВНИМАНИЕ: файл segments.csv не найден по пути", seg_file)
                 # ---------------------------
+                                # --- ЗАГРУЗКА БИЗНЕС-ВЕРДИКТА ---
+                print("Загрузка бизнес-вердикта...")
+                verdict_file = res["out_file"].replace(".csv", "_verdict.json")
+                
+                if os.path.exists(verdict_file):
+                    with open(verdict_file, "r", encoding="utf-8") as vf:
+                        v_data = json.load(vf)
+                        
+                        # Проверяем, нет ли уже вердикта для этого запуска (чтобы не было дублей)
+                        existing_verdict = db.query(models.Verdict).filter(models.Verdict.run_id == run_id).first()
+                        if not existing_verdict:
+                            db_verdict = models.Verdict(
+                                run_id=run_id,
+                                total_apps=v_data.get("total_apps", 0),
+                                ar_before=v_data.get("ar_before", 0.0),
+                                ar_after=v_data.get("ar_after", 0.0),
+                                new_approved=v_data.get("new_approved", 0),
+                                lost_approved=v_data.get("lost_approved", 0),
+                                net_impact=v_data.get("net_impact", 0),
+                                summary=v_data.get("summary", "")
+                            )
+                            db.add(db_verdict)
+                            db.commit()
+                    print("Бизнес-вердикт успешно загружен в БД!")
+                else:
+                    print(f"ВНИМАНИЕ: файл вердикта не найден по пути {verdict_file}")
+                # --------------------------------
+
 
             elif step_name == "checks":
                 import sys
