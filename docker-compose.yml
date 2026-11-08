@@ -1,0 +1,16 @@
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: spr_diff_service
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src/backend:/app/src/backend
+      - ./src/data:/app/src/data
+      - ./src/checks:/app/src/checks
+      - ./src/analytics:/app/src/analytics
+      - ./src/scripts:/app/src/scripts
+    restart: unless-stopped
