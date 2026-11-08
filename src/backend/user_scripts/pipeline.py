@@ -53,11 +53,7 @@ def main():
 
     # Путь для сохранения segments.csv рядом с основным результатом
     out_dir = os.path.dirname(out_file)
-<<<<<<< HEAD
-    segments_file = os.path.join(out_dir, "segments.csv")
-=======
     segments_file = out_file.replace(".csv", "_segments.csv")
->>>>>>> origin/backend
 
     files = sorted([f for f in os.listdir(before_dir) if f.endswith(".json")])
     if not files:
