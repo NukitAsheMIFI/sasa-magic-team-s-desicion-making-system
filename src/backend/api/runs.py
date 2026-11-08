@@ -44,21 +44,27 @@ def run_pipeline(run_id: int, config: dict):
                 script_path = "user_scripts/pipeline.py" 
                 
                 current_file = Path(__file__).resolve()
-                
-                # Находимся в src/backend/api/runs.py
-                # Поднимаемся на 3 уровня вверх: api -> backend -> src
+                # Находимся в src/backend/api/runs.py, поднимаемся до src
                 src_dir = current_file.parent.parent.parent
                 
-                # Теперь приклеиваем "data", так как она лежит внутри src
-                data_path = src_dir / "data" / "RUN-20260827-0001" / "RESULTS"
-                
                 print(f"\n!!! СТАРТ НОРМАЛИЗАЦИИ !!!")
-                print(f"Ищем данные в: {data_path}")
+                
+                # Проверяем: если фронтенд передал пути к загруженным файлам — используем их
+                if config and config.get("before_dir") and config.get("after_dir"):
+                    before_path = config["before_dir"]
+                    after_path = config["after_dir"]
+                    print(f"Используем загруженный датасет: {before_path}")
+                else:
+                    # Иначе берем стандартный датасет RUN-20260827-0001
+                    data_path = src_dir / "data" / "RUN-20260827-0001" / "RESULTS"
+                    before_path = str(data_path / "BEFORE_MASTER")
+                    after_path = str(data_path / "AFTER_BETA")
+                    print(f"Используем дефолтный датасет: {data_path}")
                 
                 input_args = {
                     "run_id": run_id,
-                    "before_dir": str(data_path / "BEFORE_MASTER"),
-                    "after_dir": str(data_path / "AFTER_BETA")
+                    "before_dir": str(before_path),
+                    "after_dir": str(after_path)
                 }
                 
                 # ВЫЗОВ СКРИПТА

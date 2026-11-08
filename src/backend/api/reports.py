@@ -200,3 +200,61 @@ def get_ai_summary(run_id: int, db: Session = Depends(get_db)):
         return {"status": "error", "summary": "Модуль ai_summary.py не найден в папке analytics."}
     except Exception as e:
         return {"status": "error", "summary": f"Ошибка генерации ИИ-мнения: {e}"}
+
+    from pydantic import BaseModel
+from database import SQLALCHEMY_DATABASE_URL
+
+class CustomCheckPayload(BaseModel):
+    name: str
+    code: str
+
+@router.post("/{run_id}/checks/custom")
+def run_custom_check(run_id: int, payload: CustomCheckPayload, db: Session = Depends(get_db)):
+    try:
+        # 1. Подключаем интерфейс MartAPI (из папки аналитики)
+        from checks_runner import MartAPI
+        
+        # 2. Формируем окружение и выполняем пользовательский код
+        local_vars = {}
+        exec(payload.code, {}, local_vars)
+        
+        if "CHECK" not in local_vars:
+            raise HTTPException(status_code=400, detail="В коде не найден объект CHECK")
+            
+        check_info = local_vars["CHECK"]
+        entrypoint = check_info.get("entrypoint")
+        if not entrypoint:
+            raise HTTPException(status_code=400, detail="В объекте CHECK отсутствует entrypoint")
+            
+        # 3. Получаем путь к базе для MartAPI
+        db_path = SQLALCHEMY_DATABASE_URL.replace("sqlite:///", "")
+        mart = MartAPI(db_path, run_id)
+        
+        # 4. Запускаем проверку
+        params = check_info.get("params", {})
+        check_results = entrypoint(mart, params)
+        
+        # 5. Сохраняем в БД
+        saved_rows = []
+        for r in check_results:
+            db_check = models.CheckResult(
+                run_id=run_id,
+                label=payload.name or r.get("LABEL", "Кастомная проверка"),
+                source=r.get("SOURCE", "AFTER"),
+                argument=r.get("ARGUMENT", ""),
+                cnt=r.get("CNT", 0),
+                total=r.get("TOTAL", 0),
+                metric=r.get("METRIC", 0.0),
+                result=r.get("RESULT", "PASS"),
+                confidence=r.get("CONFIDENCE", "HIGH"),
+                app_ids=r.get("APP_IDS", [])
+            )
+            db.add(db_check)
+            saved_rows.append(db_check)
+        
+        db.commit()
+        return {"status": "success", "message": f"Выполнено, сохранено строк: {len(saved_rows)}"}
+        
+    except Exception as e:
+        print(f"Custom Check Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import engine
 import models
-from api import runs, reports, auth
+from api import runs, reports, auth, datasets
 
 # Создаем таблицы
 models.Base.metadata.create_all(bind=engine)
@@ -25,6 +25,7 @@ app.add_middleware(
 app.include_router(runs.router, prefix="/api/runs", tags=["runs"])
 app.include_router(reports.router, prefix="/api/reports", tags=["reports"])
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 
 @app.get("/")
 def read_root():
